@@ -1,0 +1,101 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,5 +28,5 @@
+ 
+ idf_component_register(SRCS ${srcs}
+                        INCLUDE_DIRS ${public_include}
+-                       PRIV_REQUIRES esp_hal_i2s
++                       PRIV_REQUIRES esp_hal_i2s esp_rom
+                        REQUIRES soc hal)
+--- a/include/hal/mipi_dsi_hal.h
++++ b/include/hal/mipi_dsi_hal.h
+@@ -144,6 +144,9 @@
+ void mipi_dsi_hal_host_gen_read_short_packet(mipi_dsi_hal_context_t *hal, uint8_t vc,
+                                              mipi_dsi_data_type_t dt, uint16_t header_data, void *ret_buffer, uint16_t buffer_size);
+ 
++/** Whether the last serialized DSI read exhausted its bounded polling budget. */
++bool mipi_dsi_hal_host_gen_read_timed_out(void);
++
+ /**
+  * @brief Set horizontal timing parameters for DPI
+  *
+--- a/mipi_dsi_hal.c
++++ b/mipi_dsi_hal.c
+@@ -13,6 +13,7 @@
+ #include "hal/assert.h"
+ #include "hal/log.h"
+ #include "hal/mipi_dsi_periph.h"
++#include "esp_rom_sys.h"
+ 
+ HAL_LOG_ATTR_TAG(TAG, "dsi_hal");
+ 
+@@ -203,24 +204,65 @@
+     mipi_dsi_host_ll_gen_set_packet_header(hal->host, vc, dt, wc_msb, wc_lsb);
+ }
+ 
++#define MIPI_DSI_READ_TIMEOUT_US 100000U
++static bool mipi_dsi_read_timed_out;
++
++bool mipi_dsi_hal_host_gen_read_timed_out(void)
++{
++    return mipi_dsi_read_timed_out;
++}
++
++/* One budget covers both command writes, BTA completion and FIFO reception.
++ * The caller must serialize reads on the single DSI bus. Panel ID and VCOM OTP
++ * probes run during startup, before application tasks start; the LCD abstraction
++ * consumes the status immediately after each probe. */
++static bool mipi_dsi_hal_read_poll(uint32_t *remaining_us)
++{
++    if (*remaining_us == 0) {
++        mipi_dsi_read_timed_out = true;
++        return false;
++    }
++    --*remaining_us;
++    esp_rom_delay_us(1);
++    return true;
++}
++
+ void mipi_dsi_hal_host_gen_read_short_packet(mipi_dsi_hal_context_t *hal, uint8_t vc, mipi_dsi_data_type_t dt, uint16_t header_data, void *ret_buffer, uint16_t buffer_size)
+ {
+     uint8_t *receive_buffer = (uint8_t *)ret_buffer;
++    uint32_t remaining_us = MIPI_DSI_READ_TIMEOUT_US;
++    mipi_dsi_read_timed_out = false;
++    if (buffer_size == 0) {
++        return;
++    }
++    memset(receive_buffer, 0, buffer_size);
+     // set the maximum returned data size, it should equal to the parameter size of the read command
+-    mipi_dsi_hal_host_gen_write_short_packet(hal, vc, MIPI_DSI_DT_SET_MAXIMUM_RETURN_PKT, buffer_size);
++    while (mipi_dsi_host_ll_gen_is_cmd_fifo_full(hal->host)) {
++        if (!mipi_dsi_hal_read_poll(&remaining_us)) return;
++    }
++    mipi_dsi_host_ll_gen_set_packet_header(hal->host, vc, MIPI_DSI_DT_SET_MAXIMUM_RETURN_PKT,
++                                         buffer_size >> 8, buffer_size & 0xff);
+     // make sure command mode is on
+     mipi_dsi_host_ll_enable_video_mode(hal->host, false);
+     // make sure receiving is enabled
+     mipi_dsi_host_ll_enable_bta(hal->host, true);
+     // listen to the same virtual channel as the one sent to
+     mipi_dsi_host_ll_gen_set_rx_vcid(hal->host, vc);
+-    mipi_dsi_hal_host_gen_write_short_packet(hal, vc, dt, header_data);
+-    while (mipi_dsi_host_ll_gen_is_read_cmd_busy(hal->host));
++    while (mipi_dsi_host_ll_gen_is_cmd_fifo_full(hal->host)) {
++        if (!mipi_dsi_hal_read_poll(&remaining_us)) return;
++    }
++    mipi_dsi_host_ll_gen_set_packet_header(hal->host, vc, dt, header_data >> 8, header_data & 0xff);
++    while (mipi_dsi_host_ll_gen_is_read_cmd_busy(hal->host)) {
++        if (!mipi_dsi_hal_read_poll(&remaining_us)) return;
++    }
+     // wait data to come into the fifo
+-    while (mipi_dsi_host_ll_gen_is_read_fifo_empty(hal->host));
++    while (mipi_dsi_host_ll_gen_is_read_fifo_empty(hal->host)) {
++        if (!mipi_dsi_hal_read_poll(&remaining_us)) return;
++    }
+     uint32_t temp = 0;
+     uint32_t counter = 0;
+     while (!mipi_dsi_host_ll_gen_is_read_fifo_empty(hal->host)) {
++        if (!mipi_dsi_hal_read_poll(&remaining_us)) return;
+         temp = mipi_dsi_host_ll_gen_read_payload_fifo(hal->host);
+         for (int i = 0; i < 4; i++) {
+             if (counter < buffer_size) {

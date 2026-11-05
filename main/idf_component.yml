@@ -1,0 +1,15 @@
+dependencies:
+  idf: '>=6.0.2'
+  badgeteam/badge-bsp:
+    version: =2.0.0
+    override_path: ../local-components/badgeteam__badge-bsp
+  nicolaielectronics/tanmatsu-wifi: =1.3.1
+  robotman2412/pax-gfx: =2.2.2
+  robotman2412/pax-codecs: =1.0.1
+  espressif/esp_audio_codec: =2.5.0
+  espressif/cjson: =1.7.19~2
+  nicolaielectronics/es8156:
+    override_path: ../local-components/nicolaielectronics__es8156
+  nicolaielectronics/mipi_dsi_abstraction:
+    version: =2.0.0
+    override_path: ../local-components/nicolaielectronics__mipi_dsi_abstraction

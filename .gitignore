@@ -1,0 +1,25 @@
+# Build output
+build/
+dist/
+/releases/*.bin
+/releases/*.bin.sha256
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+managed_components/
+sdkconfig_*.old
+.IDF_PATH
+.IDF_TOOLS_PATH
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors
+.vscode/
+.idea/
+
+# Operating system
+.DS_Store
+Thumbs.db

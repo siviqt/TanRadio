@@ -1,0 +1,29 @@
+--- a/dsi_panel_nicolaielectronics_st7701.c
++++ b/dsi_panel_nicolaielectronics_st7701.c
+@@ -161,7 +161,7 @@
+ 
+ static st7701_configuration_t st7701_config = {0};
+ 
+-// Current VCOMS value, matches the value set in tanmatsu_display_init_sequence above
++// Current VCOMS value; synchronized with the selected sequence after initialization.
+ static uint8_t st7701_vcom = 0x2D;
+ 
+ // VCOMS value read back from the panel's NVM/OTP at reset, before the init sequence overwrites it
+@@ -379,6 +379,10 @@
+         esp_lcd_panel_io_tx_param(mipi_dbi_io, LCD_CMD_COLMOD, (uint8_t[]){config->use_24_bit_color ? 0x77 : 0x55}, 1),
+         TAG, "failed to set color mode");
+ 
++    // Mirror the sequence's VCOMS setting without another panel write. The BSP
++    // restores any saved calibration afterward through st7701_set_vcom().
++    st7701_vcom = st7701_is_display_2 ? 0x2E : 0x2D;
++
+     /*ESP_LOGI(TAG, "Register DPI panel event callback for flush ready notification");
+     esp_lcd_dpi_panel_event_callbacks_t cbs = {
+         //.on_color_trans_done = ...,
+--- a/idf_component.yml
++++ b/idf_component.yml
+@@ -11,3 +11,4 @@
+   espressif/esp_lcd_st7701: "=2.0.2~2"
+   espressif/esp_lcd_lt8912b: "=0.2.0"
+ license: "MIT"
++version: "2.0.0"
