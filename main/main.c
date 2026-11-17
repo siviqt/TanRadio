@@ -12,21 +12,10 @@ void app_main(void)
 
     // Initialize the Non Volatile Storage partition.
     res = nvs_flash_init();
-    if (res == ESP_ERR_NVS_NO_FREE_PAGES ||
-        res == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        res = nvs_flash_erase();
-        if (res != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to erase NVS flash: %s",
-                     esp_err_to_name(res));
-            return;
-        }
-
-        res = nvs_flash_init();
-    }
-
     if (res != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize NVS: %s",
+        ESP_LOGE(TAG, "Shared settings unavailable. Recover NVS from the launcher: %s",
                  esp_err_to_name(res));
+        bsp_device_restart_to_launcher();
         return;
     }
 

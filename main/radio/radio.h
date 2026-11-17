@@ -64,7 +64,7 @@ uint16_t radio_station_get_bitrate_kbps(size_t index);
 size_t radio_station_get_selected(void);
 
 /** Input task: rebase catalog indices after removal, preserving owned streams. */
-void radio_catalog_changed(void);
+void radio_apply_catalog_removal(size_t index);
 
 /**
  * @brief Select a station.

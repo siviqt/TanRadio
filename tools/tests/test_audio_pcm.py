@@ -16,6 +16,11 @@ int main(void) {
     assert(!audio_pcm_supported(32000,16,2));
     assert(!audio_pcm_supported(44100,24,2));
     assert(!audio_pcm_supported(44100,16,3));
+    assert(audio_pcm_output_rate(44100, 16, 1) == 44100);
+    assert(audio_pcm_output_rate(22050, 16, 1) == 48000);
+    assert(audio_pcm_output_rate(32000, 16, 2) == 48000);
+    assert(!audio_pcm_output_rate(96000, 16, 2));
+    assert(!audio_pcm_output_rate(32000, 24, 2));
     int16_t mono[] = {-32768,-1,0,1,32767};
     int16_t stereo[10] = {0};
     assert(audio_pcm_stereo(mono,sizeof(mono),1,stereo,5) == 5);
@@ -27,7 +32,18 @@ int main(void) {
     assert(!audio_pcm_stereo(stereo,sizeof(stereo)-2,2,copy,5));
     assert(!audio_pcm_stereo(mono,sizeof(mono),1,copy,4));
     assert(!audio_pcm_stereo(NULL,2,1,copy,5));
-    puts("PASS: rate/channel validation, exact signed mono duplication, stereo copy and partial-frame rejection");
+    audio_pcm_resampler_t one = {.input_rate = 32000}, split = {.input_rate = 32000};
+    int16_t continuous[20], chunks[20];
+    assert(!audio_pcm_resample(&one, stereo, 5, continuous, 4) && !one.primed);
+    size_t frames = audio_pcm_resample(&one, stereo, 5, continuous, 10);
+    size_t first = audio_pcm_resample(&split, stereo, 2, chunks, 4);
+    size_t second = audio_pcm_resample(&split, stereo + 4, 3, chunks + first * 2, 6);
+    assert(frames == 8 && first + second == frames && !memcmp(chunks, continuous, frames * 4));
+    int16_t extremes[] = {-32768, 32767, 32767, -32768};
+    audio_pcm_resampler_t state = {.input_rate = 24000};
+    assert(audio_pcm_resample(&state, extremes, 2, chunks, 4) == 4);
+    assert(chunks[6] == 0 && chunks[7] == 0); /* Signed interpolation at full scale. */
+    puts("PASS: PCM validation, exact mono/stereo conversion, and resampling across split buffers");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='tanradio-pcm-') as directory:

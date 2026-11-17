@@ -56,12 +56,14 @@ def main():
     for line in station_stack.read_text().splitlines():
         location, size, kind = line.split("\t")
         catalog_frames[location.rsplit(":", 1)[1]] = int(size)
-    removal = frames["ui_handle_navigation"] + frames["ui_remove_navigation"] + max(
-        frames["ui_refresh_preview"],
-        catalog_frames["stations_remove"] + catalog_frames["parse_line"] +
-        catalog_frames["parse_fields"] + catalog_frames["parse_bitrate"]
-    )
+    removal = frames["ui_handle_navigation"] + frames["ui_remove_navigation"] + frames["ui_refresh_preview"]
     assert removal <= 3072, f"Removal path owns {removal} bytes of input stack (budget 3072)"
+    catalog = frames["ui_catalog_task"] + frames.get("ui_catalog_process", 0) + max(
+        catalog_frames["stations_save"],
+        catalog_frames["stations_remove_file"] + catalog_frames["parse_line"] +
+        catalog_frames["parse_fields"] + catalog_frames["parse_bitrate"],
+    )
+    assert catalog <= 4096, f"Catalog worker owns {catalog} bytes of stack (budget 4096)"
 
     commands = json.loads((build / "compile_commands.json").read_text())
     ui_command = next(item for item in commands if item["file"].endswith("/main/ui/ui.c"))
@@ -80,7 +82,7 @@ def main():
             callers.add(caller)
     assert callers == {"ui_start", "ui_status_task"}, f"Unexpected rendering callers: {callers}"
     print(f"PASS: target UI render frames total {total}/2048 bytes; "
-          f"removal frames {removal}/3072 bytes; "
+          f"removal frames {removal}/3072 bytes; catalog worker {catalog}/4096 bytes; "
           "input only queues redraws; rendering is confined to startup/UI task")
 
 

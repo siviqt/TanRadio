@@ -39,6 +39,8 @@ static void *ui_mutex = (void *)1;
 static ui_exit_state_t ui_exit_state;
 static ui_settings_t ui_settings;
 static ui_preferences_t ui_preferences;
+static bool vivid_theme;
+static void ui_theme_select(bool enabled) { vivid_theme = enabled; }
 static unsigned ui_settings_revision, settings_frames, display_stops, logo_cancels;
 static bool fail_settings_save, fail_led_update;
 static unsigned led_updates;
@@ -146,6 +148,7 @@ static void reset(void) {
     welcome_draws = splash_frames = confirm_frames = blits = event_count = event_index = 0;
     burst_from = burst_until = 0;
     ui_preferences = (ui_preferences_t){.contrast = 60, .led_brightness = UI_LED_BRIGHTNESS_DEFAULT};
+    vivid_theme = false;
     ui_settings_revision = settings_frames = display_stops = logo_cancels = 0;
     fail_settings_save = fail_led_update = false;
     led_updates = 0;
@@ -190,9 +193,14 @@ int main(void) {
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F3);
     assert(ui_exit_state == UI_EXIT_SETTINGS && routed == 1);
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_UP);
+    assert(ui_settings.row == UI_SETTING_THEME);
+    input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_RIGHT);
+    assert(ui_settings.draft.theme == UI_THEME_VIVID && !vivid_theme);
+    input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_UP);
     assert(ui_settings.row == UI_SETTING_LED_BRIGHTNESS && ui_settings.draft.led_brightness == 50);
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_RIGHT);
     assert(ui_settings.draft.led_brightness == 55 && ui_preferences.led_brightness == 50 && !led_updates);
+    input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_DOWN);
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_DOWN);
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_RIGHT);
     assert(ui_settings.draft.display == EXTERNAL_DISPLAY_NOKIA5110 && ui_preferences.display == 0);
@@ -200,10 +208,11 @@ int main(void) {
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_RIGHT);
     fail_settings_save = true;
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F4);
-    assert(!ui_settings_revision && ui_preferences.contrast == 60 && !led_updates);
+    assert(!ui_settings_revision && ui_preferences.contrast == 60 && !led_updates && !vivid_theme);
     fail_settings_save = false;
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F4);
     assert(ui_settings_revision == 1 && ui_preferences.contrast == 61);
+    assert(ui_preferences.theme == UI_THEME_VIVID && vivid_theme);
     assert(ui_preferences.led_brightness == 55 && led_brightness == 55 && led_updates == 1);
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_RIGHT);
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F1);
@@ -273,6 +282,16 @@ int main(void) {
     assert(welcome_draws == 1 && settings_frames == 2 && confirm_frames == 2);
     assert(ui_settings_revision == 1 && ui_preferences.contrast == 62);
 
+    reset();
+    nav(BSP_INPUT_NAVIGATION_KEY_F1, true);
+    nav(BSP_INPUT_NAVIGATION_KEY_F3, true);
+    nav(BSP_INPUT_NAVIGATION_KEY_UP, true);
+    nav(BSP_INPUT_NAVIGATION_KEY_RIGHT, true);
+    nav(BSP_INPUT_NAVIGATION_KEY_F4, true);
+    nav(BSP_INPUT_NAVIGATION_KEY_F2, true); nav(BSP_INPUT_NAVIGATION_KEY_F2, false);
+    nav(BSP_INPUT_NAVIGATION_KEY_F2, true); space();
+    assert(ui_show_welcome() && vivid_theme && welcome_draws == 2);
+
     reset(); no_cache = true;
     nav(BSP_INPUT_NAVIGATION_KEY_F1, true); nav(BSP_INPUT_NAVIGATION_KEY_F2, true); space();
     assert(ui_show_welcome() && welcome_draws == 3 && confirm_frames == 1);
@@ -291,6 +310,7 @@ int main(void) {
     reset();
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F1);
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F3);
+    input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_UP);
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_UP);
     for (unsigned i = 0; i < 11; i++) input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_LEFT);
     assert(ui_settings.draft.led_brightness == 0);

@@ -1,7 +1,7 @@
 # TanRadio
 
 TanRadio is an Internet radio application for the Tanmatsu platform.
-This source builds **0.8.4, AppFS revision 15**, using BSP/LCD 2.0.0 for both
+This source builds **0.9.0, AppFS revision 17**, using BSP/LCD 2.0.0 for both
 Tanmatsu display variants.
 
 On every launch, an 800 × 480 welcome screen explains Wi-Fi setup and the
@@ -44,6 +44,9 @@ take effect when you press **Space** to start TanRadio.
 - **LED brightness** defaults to 50% and adjusts the RGB status LEDs from
   0% to 100% in 5 percentage-point steps. **F4 Apply** updates the LEDs
   and saves the brightness for the next launch.
+- **Theme** switches the built-in screen between Midnight and Vivid. Vivid uses
+  a stronger blue highlight and saturated cyan focus outline. F4 applies the
+  theme immediately and saves it for the next launch.
 
 The Nokia driver uses the following Tanmatsu CATT wiring. Leave the LCD's
 `LIGHT` disconnected and unplug the external JTAG adapter.
@@ -81,8 +84,12 @@ Press **F2** to open **Add station**. Type a station name and press **Enter**
 to search Radio Browser. Press **Tab** to switch between station name and
 country search (switching clears the query). In country mode, enter a country
 name such as `Bulgaria` or a two-letter code such as `BG` (case-insensitive).
-Press **Enter**, then use **Up/Down** to select one of up to 20 results,
-then **F4** to play a preview or **F5** to save it. **F2** or **Esc** returns to the
+Press **Enter**, then use **Up/Down** to scroll through the results in name order.
+TanRadio loads more results in the background as the selection approaches the
+end of the loaded rows. Beside **↑↓ Browse**, the footer shows **Start of results**,
+**End of results**, or **Only result** when you highlight that boundary.
+**F4** previews the selected station and **F5** saves it while pages load.
+**Enter** retries a failed page. **F2** or **Esc** returns to the
 station list. Typing or closing the dialog cancels an outstanding search;
 preview playback continues when the dialog closes. Saved results are marked
 **Saved**; their Save action is disabled. Moving to another result clears the
@@ -104,7 +111,7 @@ and opening the dialog does not stop, mute, or replace the current station.
 | F6 / power button | Toggle illumination | Toggle illumination |
 | Hyper (between left Ctrl and Alt) | About TanRadio | About TanRadio |
 | Up / Down | Move highlight | Move highlight |
-| Enter | Play highlighted station; never mute | Search by name |
+| Enter | Play highlighted station | Submit the search or retry a failed page |
 | Esc | Highlight current station | Back to station list |
 | Backspace | Remove highlighted saved station (confirmation) | Delete previous character |
 
@@ -138,10 +145,10 @@ date/time and a short ELF build ID. An unavailable panel ID is shown as Unknown.
 
 ## Station catalog
 
-Search currently accepts direct, non-HLS MP3 streams. Refine the name or country to find
-more specific results. Radio Browser's compatibility and availability data
-can be stale, so individual stations may still fail to play. Directory errors
-do not replace the saved station list or interrupt an existing stream.
+Search includes MP3, AAC/AAC+, Ogg Opus and Vorbis, native FLAC, and HLS entries
+listed as MP3 or AAC. Radio Browser's labels and availability can be stale.
+TanRadio checks the actual stream bytes at playback. Directory errors preserve
+the saved station list and current playback.
 
 An SD card is required. TanRadio includes no bundled stations: a new catalog
 starts empty. Press F2 to find stations and F5 to save them. Existing SD-card
@@ -175,11 +182,10 @@ Install ESP-IDF **v6.0.2**, then run `make build`. Set `IDF_PATH` and
 `IDF_TOOLS_PATH` if your SDK is installed outside the default locations shown
 by `make print-sdk`. The firmware is built as `build/tanmatsu/application.bin`.
 
-Run `make release` to generate `releases/TanRadio.bin` and its SHA-256 checksum.
-Verify the generated image with
-`cd releases && sha256sum -c TanRadio.bin.sha256`. This is the application image
-for installation through the Tanmatsu launcher/AppFS tooling; it is not a
-merged full-flash image.
+The release bundle contains the AppFS image `releases/TanRadio.bin` and its
+SHA-256 checksum. Run `make release` to build and generate this pair locally.
+Verify the image with `cd releases && sha256sum -c TanRadio.bin.sha256`.
+See the [release notes](releases/README.md) for the device-tested image.
 
 The application uses **badge-bsp 2.0.0**, **LCD abstraction 2.0.0** and
 **ES8156 0.1.0** in `local-components/`, retaining TanRadio's previously tested
@@ -191,9 +197,13 @@ the status bar identifies the active output. Levels are saved to application NVS
 after adjustments settle and again on normal exit. The local BSP applies the
 upstream 0.70 scaling, limiting maximum codec gain to approximately -6 dB.
 
-Playback accepts 16-bit mono/stereo MP3 output at 44.1 or 48 kHz. Mono is duplicated
-to both channels, and sample-rate transitions discard queued audio before changing
-I2S clocks. Unsupported formats stop with an on-screen error.
+Playback accepts signed 16-bit mono/stereo PCM from the decoder at 8–48 kHz.
+44.1 and 48 kHz play at native rates. Other rates in that range are resampled
+to 48 kHz. Mono is duplicated to both channels. Audio-only HLS supports
+unencrypted MPEG-TS and packed ADTS/MP3 segments. Encrypted playlists,
+fragmented MP4, and byte-range segments show an unsupported-playlist error.
+Sample-rate transitions discard old PCM before changing I2S clocks. Permanent
+stream errors are shown on screen and transient failures retry with backoff.
 Keep the local components together; the registry BSP/driver pair is not an
 equivalent replacement. See [local-components/README.md](local-components/README.md).
 
@@ -233,7 +243,7 @@ Python 3 and a C compiler with pthreads and sanitizer support; the UI stack chec
 also uses the ESP32-P4 build output. See [tools/README.md](tools/README.md).
 Use `make clean` to remove build outputs, or `make fullclean` to also
 remove downloaded dependencies. Both preserve the production configuration
-in `sdkconfig_tanmatsu`, the defaults in `sdkconfigs/`, and any locally generated release.
+in `sdkconfig_tanmatsu`, the defaults in `sdkconfigs/`, and the packaged release.
 
 ## Install through BadgeLink
 
@@ -262,8 +272,9 @@ unpacked staging copies are removed. Verify the package with
 `sha256sum -c SHA256SUMS` from its output directory. Packaging refuses to overwrite
 an existing destination; move that folder before recreating the same release.
 
-After `make release`, run `make source-export` to create the source-and-release
-snapshot at `dist/TanRadio-source/`. It contains the current application
+With the release files in place, run `make source-export` to create
+`dist/TanRadio-source/`. Copy that folder to the location of your new Git
+repository. It contains the current application
 source, local components and their licenses, build configuration, pinned
 dependencies, assets, documentation, tests, and the current binary/checksum.
 The export includes neither Git history nor generated build/download caches, machine

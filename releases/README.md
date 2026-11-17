@@ -1,26 +1,23 @@
-# TanRadio 0.8.4, revision 15
+# TanRadio 0.9.0, revision 17
 
-`TanRadio.bin` is the Tanmatsu ESP32-P4 AppFS image built with ESP-IDF 6.0.2
-and BSP/LCD 2.0.0. This release adds saved brightness for the RGB status LEDs.
-Open **F1 → F3**, choose **LED brightness**, and press **F4 Apply** after editing.
-Brightness defaults to 50% and changes by 5 percentage points.
+The release bundle contains the Tanmatsu ESP32-P4 AppFS image as
+`TanRadio.bin`, built with ESP-IDF 6.0.2 and BSP/LCD 2.0.0. It adds audio
+formats including AAC/AAC+, Ogg Opus/Vorbis, FLAC, and audio-only HLS.
+**F1 → F3** opens Settings, where you can choose Vivid and save it with
+**F4 Apply**. Radio Browser search loads pages in either direction and marks
+the first, last, or only result in the footer.
 
-Now Playing uses ICY stream metadata, scrolls long labels, and supports
-local or opt-in station logos. Settings also configures the Nokia 5110
-external display, which shows playback state, battery, and volume.
+All 20 regression scripts passed. The owner tested the audio formats, theme,
+and search on Tanmatsu. The release image matched the BadgeLink readback byte
+for byte. Its SHA-256 is
+`cb6355f6563b11fabeeec0bf986ffc4a822521fa665646647b485fda976c7bbb`.
 
-The firmware passed all 19 regression scripts. A BadgeLink readback matched
-this image byte for byte, and the owner accepted the build after testing it on
-Tanmatsu.
-
-Run `make release` from the project root to generate the binary and checksum.
-Then verify the binary from this directory:
+From the release bundle's `releases/` directory, verify the downloaded image.
 
 ```sh
 sha256sum -c TanRadio.bin.sha256
 ```
 
-Install through the Tanmatsu application repository or upload to AppFS with
-BadgeLink using the slug `com.github.siviqt.tanradio` and revision **15**.
-The source and app-repository archives are under `dist/TanRadio-0.8.4-r15/`
-in the working checkout.
+The Tanmatsu app package uses `com.github.siviqt.tanradio` and AppFS
+revision **17**. The source and app package archives use the
+`TanRadio-0.9.0-r17` release name.

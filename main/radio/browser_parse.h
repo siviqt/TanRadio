@@ -5,7 +5,7 @@
 
 /* Pure parsers shared by the device client and host regression tests. */
 bool browser_parse_stations(const char *json, radio_station_t *results,
-                             size_t capacity, size_t *count);
+                            size_t capacity, size_t *count, size_t *raw_count);
 #define BROWSER_MIRROR_LIMIT 6
 #define BROWSER_HOST_LENGTH 96
 size_t browser_parse_srv(const uint8_t *packet, size_t length, uint16_t query_id,

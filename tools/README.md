@@ -13,6 +13,10 @@ are removed so the working checkout remains the single source tree. Source expor
 include only the current release. See `local-components/README.md` for the
 BSP 2.0.0/LCD 2.0.0 integration, retained fixes and SDK snapshot provenance.
 
+To package a release pair that already passed device testing, run
+`python3 tools/package_release.py` from the app folder. It uses
+`releases/TanRadio.bin` and `releases/TanRadio.bin.sha256` as inputs.
+
 `generate_build_info.py` compiles the app version/revision from `metadata.json`
 and component versions supplied by ESP-IDF into the About screen's constants.
 Its print options also supply the firmware build version and BadgeLink revision,
@@ -54,7 +58,9 @@ After `make build` has fetched cJSON, run
 SD catalog implementation. It uses temporary files, AddressSanitizer and
 UndefinedBehaviorSanitizer, and injected rename/fsync failures to verify
 compatibility filtering, DNS bounds, duplicate handling, persistence, limits,
-and interrupted-save recovery. It requires `cc` with sanitizer support and
+and interrupted-save recovery. The paging fixture checks retry, eviction,
+reverse refetch, and the difference between a cached page edge and a confirmed
+result boundary. It requires `cc` with sanitizer support and
 does not access the network or the device's SD card.
 
 Run `python3 tools/tests/test_controls.py` to exercise the production control
@@ -82,7 +88,9 @@ simulate PSRAM arbitration or establish that rare hardware underruns are gone.
 Run `python3 tools/tests/test_audio_gain.py` to execute the production BSP and
 codec percentage conversion functions against a register mock. It verifies the
 0xB3 ceiling, monotonicity, quantized readback, bounds, and hardware errors.
-`test_audio_pcm.py` checks exact mono/stereo conversion and format validation;
+`test_audio_pcm.py` checks mono/stereo conversion, resampling, and PCM validation.
+`test_stream_formats.py` checks stream probes and HLS playlist, segment, and
+metadata handling.
 `test_audio_pipeline.py` checks queue retirement before rate changes, silence
 until buffering completes, user mute, failed configuration and switch/stop gates.
 The audio shutdown test also covers independent route levels, NVS restore,
@@ -93,7 +101,7 @@ These checks cannot establish analog distortion or the absence of audible pops.
 idempotence and no-format policy, shared SDMMC cleanup, VCOM restoration and
 native-buffer configuration. It also checks the actual HAL read implementation
 for payload bounds, command/BTA/FIFO timeouts and recovery after a timeout.
-It is included in `make test`, alongside the other 15 regression scripts.
+It is included in `make test`.
 
 `test_display_variants.py` compiles the complete production ST7701 driver and
 the BSP's actual saved-calibration restoration against a panel/NVS mock. Its

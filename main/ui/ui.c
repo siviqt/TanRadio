@@ -84,6 +84,7 @@ static pax_buf_t framebuffer = {0};
 #define UI_STATION_ROW_HEIGHT 55
 #define UI_STATION_VISIBLE_COUNT 5
 #define UI_STATION_SELECTED_ROW 2
+#define UI_SEARCH_VISIBLE_COUNT 5
 
 #define UI_LEGEND_HEIGHT 62
 #define UI_LEGEND_FUNCTION_WIDTH 124
@@ -115,9 +116,16 @@ static atomic_int ui_services_state = UI_SERVICES_STARTING;
 #define UI_EXIT_SPLASH_MS 1000
 static char ui_search_query[BROWSER_QUERY_LENGTH + 1];
 static radio_browser_search_mode_t ui_search_mode = BROWSER_SEARCH_NAME;
-static size_t ui_search_selection;
 static char ui_search_notice[96];
 static unsigned ui_search_revision;
+typedef struct {
+    bool remove;
+    size_t index;
+    radio_station_t station;
+} ui_catalog_job_t;
+
+static QueueHandle_t ui_catalog_jobs;
+static bool ui_catalog_busy;
 static struct {
     bool open;
     bool failed;
@@ -152,7 +160,7 @@ static TaskHandle_t ui_status_task_handle = NULL;
 static struct {
     radio_now_playing_t now_playing;
     radio_station_t selected;
-    radio_station_t row;
+    radio_station_t search_rows[UI_SEARCH_VISIBLE_COUNT];
 } ui_render_state;
 /* The status/render task owns these copies, including the thumbnail's pixels. */
 static radio_now_playing_t ui_now_playing;
@@ -508,7 +516,7 @@ static void ui_draw_button_legend(void)
     const float separator_y = ui_height - UI_LEGEND_HEIGHT;
     radio_station_t *selected = &ui_render_state.selected;
     const radio_playback_status_t *playback = &ui_render_state.now_playing.playback;
-    bool have_selected = ui_search_open ? radio_browser_result(ui_search_selection, selected) :
+    bool have_selected = ui_search_open ? radio_browser_selected(selected) :
                                          ui_main_selected_station(selected);
     ui_station_action_t action = ui_station_action(have_selected ? selected : NULL, playback);
     bool saved = ui_search_open && have_selected && stations_find(selected, NULL);
@@ -517,8 +525,8 @@ static void ui_draw_button_legend(void)
         ui_search_open ? (saved ? "Saved" : "Save") : "Next", "Lights"
     };
     if (ui_remove_state.open) {
-        labels[1] = "Cancel";
-        labels[3] = "Remove";
+        labels[1] = ui_catalog_busy ? "" : "Cancel";
+        labels[3] = ui_catalog_busy ? "Removing" : "Remove";
         labels[4] = "";
     }
 
@@ -548,7 +556,7 @@ static void ui_draw_button_legend(void)
             &framebuffer,
             (index == 3 && !ui_remove_state.open && action == UI_STATION_DISABLED) ||
             (index == 2 && playback->stopped) ||
-            (index == 4 && (ui_search_open ? (!have_selected || saved) : !stations_count()))
+            (index == 4 && (ui_search_open ? (!have_selected || saved || ui_catalog_busy) : !stations_count()))
                 ? UI_COLOR_DISABLED : UI_COLOR_TEXT,
             UI_FONT_BODY,
             UI_TEXT_SMALL,
@@ -800,13 +808,14 @@ static bool ui_status_changed(void)
 static void ui_draw_search(void)
 {
     radio_browser_status_t search;
-    radio_browser_status(&search);
-    if (ui_search_selection >= search.count) ui_search_selection = 0;
+    size_t selected_row;
+    size_t count = radio_browser_window(&search, ui_render_state.search_rows,
+                                        UI_SEARCH_VISIBLE_COUNT, &selected_row);
     pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_HEADING,
                   UI_TEXT_TITLE, 24, 72, ui_search_mode == BROWSER_SEARCH_COUNTRY ?
                   "Add station · Country" : "Add station · Name");
     pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY,
-                  UI_TEXT_SMALL, 530, 85, "Radio Browser · MP3");
+                  UI_TEXT_SMALL, 618, 85, "Radio Browser");
     pax_draw_round_rect(&framebuffer, UI_COLOR_FIELD, 24, 116, 752, 44, 8);
     char line[160];
     ui_ellipsize_text(UI_FONT_BODY, ui_search_query[0] ? ui_search_query :
@@ -818,33 +827,39 @@ static void ui_draw_search(void)
                       line, sizeof(line), UI_TEXT_SMALL, 752);
     pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL, 24, 170, line);
 
-    size_t first = (ui_search_selection / 5) * 5;
-    for (size_t row = 0; row < 5 && first + row < search.count; row++) {
-        radio_station_t *station = &ui_render_state.row;
-        if (!radio_browser_result(first + row, station)) continue;
+    for (size_t row = 0; row < count; row++) {
+        const radio_station_t *station = &ui_render_state.search_rows[row];
         float y = 205 + row * 33;
-        if (first + row == ui_search_selection) {
+        if (row == selected_row) {
             pax_draw_round_rect(&framebuffer, UI_COLOR_ACCENT, 24, y - 3, 752, 31, 6);
             pax_draw_round_rect(&framebuffer, UI_COLOR_SELECTION, 26, y - 1, 748, 27, 4);
         }
         bool saved = stations_find(station, NULL);
-        ui_ellipsize_text(UI_FONT_BODY, station->name, line, sizeof(line), 20, 490);
+        ui_ellipsize_text(UI_FONT_BODY, station->name, line, sizeof(line), 20, 440);
         pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_BODY, 20, 36, y, line);
         if (station->bitrate_kbps) {
-            snprintf(line, sizeof(line), "%s%s  %u kbps", saved ? "Saved  " : "",
-                     station->country, station->bitrate_kbps);
+            snprintf(line, sizeof(line), "%s%s  %s  %u kbps", saved ? "Saved  " : "",
+                     station->country, station->codec, station->bitrate_kbps);
         } else {
-            snprintf(line, sizeof(line), "%s%s  MP3", saved ? "Saved  " : "", station->country);
+            snprintf(line, sizeof(line), "%s%s  %s", saved ? "Saved  " : "", station->country, station->codec);
         }
         char details[160];
-        ui_ellipsize_text(UI_FONT_BODY, line, details, sizeof(details), UI_TEXT_SMALL, 218);
-        pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL, 546, y + 1, details);
+        ui_ellipsize_text(UI_FONT_BODY, line, details, sizeof(details), UI_TEXT_SMALL, 274);
+        pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL, 490, y + 1, details);
     }
-    pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL, 280, 376,
-                  "Tab Name/Country   Enter Search   ↑↓ Select");
-    if (search.count) {
-        snprintf(line, sizeof(line), "%zu / %zu results", ui_search_selection + 1, search.count);
-        pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL, 24, 376, line);
+    const float footer_y = 376;
+    pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL, 24, footer_y,
+                  "Tab Name/Country   Enter Search   ↑↓ Browse");
+    const char *boundary = NULL;
+    if (search.at_start) {
+        boundary = search.at_end ? "Only result" : "Start of results";
+    } else if (search.at_end) {
+        boundary = "End of results";
+    }
+    if (boundary) {
+        float width = pax_text_size(UI_FONT_BODY, UI_TEXT_SMALL, boundary).x;
+        pax_draw_text(&framebuffer, UI_COLOR_ACCENT, UI_FONT_BODY, UI_TEXT_SMALL,
+                      776 - width, footer_y, boundary);
     }
     const radio_station_t *playing = &ui_render_state.now_playing.playback.station;
     if (playing->url[0]) {
@@ -869,7 +884,7 @@ static void ui_draw_remove_dialog(void)
     pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_BODY, 28, 36, 164, first);
     pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_BODY, 28, 36, 204, second);
     pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, 20, 36, 274,
-                  "F4 Remove     F2 Cancel");
+                  ui_catalog_busy ? "Removing station…" : "F4 Remove     F2 Cancel");
     if (ui_remove_state.failed) {
         pax_draw_text(&framebuffer, UI_COLOR_WARNING, UI_FONT_BODY, 18, 36, 330,
                       "Could not remove. Check the SD card. F4 retries; F2 cancels.");
@@ -984,6 +999,10 @@ static void ui_draw_now_playing(const radio_now_playing_t *snapshot)
     uint16_t rate = metadata->bitrate_kbps ? metadata->bitrate_kbps : station->bitrate_kbps;
     snprintf(details, sizeof(details), "%s%s%s", station->country,
              station->country[0] && metadata->genre[0] ? " · " : "", metadata->genre);
+    if (metadata->format[0]) {
+        size_t used = strlen(details);
+        snprintf(details + used, sizeof(details) - used, "%s%s", used ? " · " : "", metadata->format);
+    }
     if (rate) {
         size_t used = strlen(details);
         snprintf(details + used, sizeof(details) - used, "%s%u kbps", used ? " · " : "", (unsigned)rate);
@@ -1294,6 +1313,7 @@ bool ui_handle_exit_navigation(bsp_input_navigation_key_t key)
         xSemaphoreTake(ui_mutex, portMAX_DELAY);
         if (saved) {
             ui_preferences = draft;
+            ui_theme_select(draft.theme == UI_THEME_VIVID);
             ++ui_settings_revision;
         }
         ui_settings.notice = !saved ? "Could not save settings · F4 retries" :
@@ -1307,6 +1327,59 @@ bool ui_handle_exit_navigation(bsp_input_navigation_key_t key)
     return consumed;
 }
 
+static bool ui_catalog_submit(const ui_catalog_job_t *job)
+{
+    if (!ui_catalog_jobs || ui_catalog_busy || xQueueSend(ui_catalog_jobs, job, 0) != pdTRUE)
+        return false;
+    ui_catalog_busy = true;
+    return true;
+}
+
+static void ui_catalog_process(const ui_catalog_job_t *job)
+{
+    size_t index = job->index;
+    bool duplicate = false;
+    esp_err_t result = job->remove ? stations_remove_file(STATIONS_FILE_PATH, index) :
+        stations_save(STATIONS_FILE_PATH, &job->station, &index, &duplicate);
+
+    xSemaphoreTake(ui_mutex, portMAX_DELAY);
+    ui_catalog_busy = false;
+    if (job->remove) {
+        ui_remove_state.failed = result != ESP_OK;
+        if (result == ESP_OK) {
+            radio_apply_catalog_removal(index);
+            ui_remove_state.open = false;
+            ui_refresh_preview();
+            size_t count = stations_count();
+            if (ui_station_list.has_preview && stations_same(&ui_station_list.preview, &job->station))
+                ui_station_list.selection = SIZE_MAX;
+            else if (count)
+                ui_station_list.selection = index < count ? index : count - 1;
+        }
+    } else {
+        radio_station_t selected;
+        if (ui_search_open && radio_browser_selected(&selected) && stations_same(&selected, &job->station)) {
+            const char *notice = result == ESP_OK ? (duplicate ? "Already saved in your stations." :
+                "Saved to your stations.") : result == ESP_ERR_NO_MEM ? "Station list is full (128 stations)." :
+                result == ESP_ERR_INVALID_SIZE ? "Station file is full (64 KiB)." :
+                "Could not save. Check the SD card and free space.";
+            snprintf(ui_search_notice, sizeof(ui_search_notice), "%s", notice);
+            if (result == ESP_OK) ui_station_list.selection = index;
+        }
+        ui_refresh_preview();
+    }
+    xSemaphoreGive(ui_mutex);
+    ui_draw();
+}
+
+static void ui_catalog_task(void *unused)
+{
+    (void)unused;
+    ui_catalog_job_t job;
+    while (xQueueReceive(ui_catalog_jobs, &job, portMAX_DELAY) == pdTRUE) ui_catalog_process(&job);
+    vTaskDelete(NULL);
+}
+
 static bool ui_remove_navigation(bsp_input_navigation_key_t key)
 {
     xSemaphoreTake(ui_mutex, portMAX_DELAY);
@@ -1316,33 +1389,19 @@ static bool ui_remove_navigation(bsp_input_navigation_key_t key)
             return false;
         }
         ui_refresh_preview();
-        if (ui_station_list.selection < stations_count() &&
+        if (!ui_catalog_busy && ui_station_list.selection < stations_count() &&
             ui_main_selected_station(&ui_remove_state.station)) {
             ui_remove_state.index = ui_station_list.selection;
             ui_remove_state.failed = false;
             ui_remove_state.open = true;
         }
     } else if (key == BSP_INPUT_NAVIGATION_KEY_F2 || key == BSP_INPUT_NAVIGATION_KEY_ESC) {
-        ui_remove_state.open = false;
+        if (!ui_catalog_busy) ui_remove_state.open = false;
     } else if (key == BSP_INPUT_NAVIGATION_KEY_F4) {
-        /* Unlike append, removal compacts published records. Exclude catalog
-         * readers with ui_mutex throughout the bounded SD transaction. The
-         * audio worker only uses owned records and never needs this mutex. */
-        esp_err_t result = stations_remove(STATIONS_FILE_PATH, ui_remove_state.index);
-        ui_remove_state.failed = result != ESP_OK;
-        if (result == ESP_OK) {
-            radio_catalog_changed();
-            ui_remove_state.open = false;
-            ui_refresh_preview();
-            /* Removing the active entry keeps it selected as a Preview. */
-            if (ui_station_list.has_preview &&
-                stations_same(&ui_station_list.preview, &ui_remove_state.station)) {
-                ui_station_list.selection = SIZE_MAX;
-            } else if (ui_remove_state.index < stations_count()) {
-                ui_station_list.selection = ui_remove_state.index;
-            } else if (stations_count()) {
-                ui_station_list.selection = stations_count() - 1;
-            }
+        if (!ui_catalog_busy) {
+            ui_catalog_job_t job = {.remove = true, .index = ui_remove_state.index,
+                                    .station = ui_remove_state.station};
+            ui_remove_state.failed = !ui_catalog_submit(&job);
         }
     } else if (key == BSP_INPUT_NAVIGATION_KEY_F3 || key == BSP_INPUT_NAVIGATION_KEY_F6) {
         xSemaphoreGive(ui_mutex);
@@ -1362,15 +1421,12 @@ static bool ui_search_navigation(bsp_input_navigation_key_t key)
             return false;
         }
         ui_search_open = true;
-        ui_search_selection = 0;
         ui_search_notice[0] = 0;
         radio_browser_cancel();
         xSemaphoreGive(ui_mutex);
         ui_draw();
         return true;
     }
-    radio_browser_status_t search;
-    radio_browser_status(&search);
     if (key == BSP_INPUT_NAVIGATION_KEY_ESC || key == BSP_INPUT_NAVIGATION_KEY_F2) {
         ui_search_open = false;
         radio_browser_cancel();
@@ -1380,7 +1436,6 @@ static bool ui_search_navigation(bsp_input_navigation_key_t key)
         ui_search_mode = ui_search_mode == BROWSER_SEARCH_NAME ? BROWSER_SEARCH_COUNTRY : BROWSER_SEARCH_NAME;
         ui_search_query[0] = 0;
         ui_search_notice[0] = 0;
-        ui_search_selection = 0;
         radio_browser_cancel();
     } else if (key == BSP_INPUT_NAVIGATION_KEY_BACKSPACE) {
         size_t length = strlen(ui_search_query);
@@ -1388,7 +1443,6 @@ static bool ui_search_navigation(bsp_input_navigation_key_t key)
             do { length--; } while (length && ((unsigned char)ui_search_query[length] & 0xc0) == 0x80);
             ui_search_query[length] = 0;
             ui_search_notice[0] = 0;
-            ui_search_selection = 0;
             radio_browser_cancel();
         }
     } else if (key == BSP_INPUT_NAVIGATION_KEY_RETURN) {
@@ -1397,49 +1451,35 @@ static bool ui_search_navigation(bsp_input_navigation_key_t key)
             if (*p > 32) nonspace = true;
         }
         ui_search_notice[0] = 0;
-        ui_search_selection = 0;
         if (nonspace) {
-            if (!radio_browser_search_by(ui_search_query, ui_search_mode)) {
+            if (!radio_browser_retry() && !radio_browser_search_by(ui_search_query, ui_search_mode)) {
                 snprintf(ui_search_notice, sizeof(ui_search_notice), "Search unavailable or busy. Press Enter to retry.");
             }
         } else {
             snprintf(ui_search_notice, sizeof(ui_search_notice), "%s", ui_search_mode == BROWSER_SEARCH_COUNTRY ?
                      "Type a country name or code first." : "Type a station name first.");
         }
-    } else if (key == BSP_INPUT_NAVIGATION_KEY_UP && search.count) {
-        ui_search_selection = (ui_search_selection + search.count - 1) % search.count;
-        ui_search_notice[0] = 0;
-    } else if (key == BSP_INPUT_NAVIGATION_KEY_DOWN && search.count) {
-        ui_search_selection = (ui_search_selection + 1) % search.count;
+    } else if (key == BSP_INPUT_NAVIGATION_KEY_UP || key == BSP_INPUT_NAVIGATION_KEY_DOWN) {
+        radio_browser_move(key == BSP_INPUT_NAVIGATION_KEY_UP ? -1 : 1);
         ui_search_notice[0] = 0;
     } else if (key == BSP_INPUT_NAVIGATION_KEY_F4 || key == BSP_INPUT_NAVIGATION_KEY_F5) {
-        radio_station_t station;
-        bool selected = radio_browser_result(ui_search_selection, &station);
-        /* Audio control and SD I/O never run under the framebuffer mutex. */
-        xSemaphoreGive(ui_mutex);
-        char notice[96];
-        size_t saved_index = 0;
-        bool saved = false;
-        if (!selected) {
-            snprintf(notice, sizeof(notice), "Select a search result first.");
+        ui_catalog_job_t job = {0};
+        if (!radio_browser_selected(&job.station)) {
+            snprintf(ui_search_notice, sizeof(ui_search_notice), "Select a search result first.");
         } else if (key == BSP_INPUT_NAVIGATION_KEY_F4) {
-            bool playing = ui_activate_station(&station, true);
-            snprintf(notice, sizeof(notice), "%s", playing ? "" :
+            /* Audio control remains outside the framebuffer mutex. */
+            xSemaphoreGive(ui_mutex);
+            bool playing = ui_activate_station(&job.station, true);
+            xSemaphoreTake(ui_mutex, portMAX_DELAY);
+            ui_focus_current_station();
+            ui_refresh_preview();
+            snprintf(ui_search_notice, sizeof(ui_search_notice), "%s", playing ? "" :
                      "Playback unavailable. Check the SD card and restart TanRadio.");
         } else {
-            bool duplicate;
-            esp_err_t result = stations_save(STATIONS_FILE_PATH, &station, &saved_index, &duplicate);
-            saved = result == ESP_OK;
-            snprintf(notice, sizeof(notice), "%s", saved ? (duplicate ? "Already saved in your stations." :
-                     "Saved to your stations.") : result == ESP_ERR_NO_MEM ? "Station list is full (128 stations)." :
-                     result == ESP_ERR_INVALID_SIZE ? "Station file is full (64 KiB)." :
-                     "Could not save. Check the SD card and free space.");
+            const char *notice = ui_catalog_submit(&job) ? "Saving station…" :
+                ui_catalog_busy ? "A station change is already in progress." : "Station storage is unavailable.";
+            snprintf(ui_search_notice, sizeof(ui_search_notice), "%s", notice);
         }
-        xSemaphoreTake(ui_mutex, portMAX_DELAY);
-        if (saved) ui_station_list.selection = saved_index;
-        else if (selected && key == BSP_INPUT_NAVIGATION_KEY_F4) ui_focus_current_station();
-        ui_refresh_preview();
-        snprintf(ui_search_notice, sizeof(ui_search_notice), "%s", notice);
     } else if (key == BSP_INPUT_NAVIGATION_KEY_F3 ||
                key == BSP_INPUT_NAVIGATION_KEY_F6) {
         xSemaphoreGive(ui_mutex);
@@ -1640,7 +1680,6 @@ void ui_handle_keyboard(
             if (added && length + added <= BROWSER_QUERY_LENGTH) {
                 memcpy(ui_search_query + length, utf8, added + 1);
                 ui_search_notice[0] = 0;
-                ui_search_selection = 0;
                 radio_browser_cancel();
             } else if (added) {
                 snprintf(ui_search_notice, sizeof(ui_search_notice),
@@ -1978,6 +2017,7 @@ void ui_init(void)
              display_rotation);
 
     ui_preferences_load(&ui_preferences);
+    ui_theme_select(ui_preferences.theme == UI_THEME_VIVID);
     ui_mutex = xSemaphoreCreateMutex();
     if (ui_mutex == NULL) {
         ESP_LOGE(TAG, "Failed to create UI mutex");
@@ -1991,6 +2031,11 @@ void ui_init(void)
 
 void ui_start(void)
 {
+    ui_catalog_jobs = xQueueCreate(1, sizeof(ui_catalog_job_t));
+    if (ui_catalog_jobs && xTaskCreate(ui_catalog_task, "tanradio_catalog", 6144, NULL, 2, NULL) != pdPASS) {
+        vQueueDelete(ui_catalog_jobs);
+        ui_catalog_jobs = NULL;
+    }
     ui_services_started = true;
     /* Shared launcher icons are read-only; vector symbols remain the fallback. */
     ui_load_function_icons();
@@ -2067,6 +2112,7 @@ bool ui_show_welcome(void)
     const size_t frame_size = pax_buf_get_size(&framebuffer);
     void *background = heap_caps_malloc(frame_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (background) memcpy(background, pax_buf_get_pixels(&framebuffer), frame_size);
+    ui_theme_t background_theme = ui_preferences.theme;
     bool redraw = !ui_blit();
     input_keys_t keys;
     input_keys_init(&keys, pdMS_TO_TICKS(500), pdMS_TO_TICKS(100));
@@ -2116,10 +2162,12 @@ bool ui_show_welcome(void)
                 free(background);
                 background = NULL;
                 ui_draw_session_screen(true);
-            } else if (background) {
+            } else if (background && background_theme == ui_preferences.theme) {
                 memcpy(pax_buf_get_pixels_rw(&framebuffer), background, frame_size);
             } else {
                 ui_draw_session_screen(false);
+                if (background) memcpy(background, pax_buf_get_pixels(&framebuffer), frame_size);
+                background_theme = ui_preferences.theme;
             }
             if (ui_exit_state == UI_EXIT_CONFIRM) ui_draw_exit_confirmation();
             else if (ui_exit_state == UI_EXIT_SETTINGS) ui_settings_draw(&framebuffer, &ui_settings, false);

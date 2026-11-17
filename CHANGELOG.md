@@ -1,5 +1,20 @@
 # TanRadio production changelog
 
+## 0.9.0 revision 17 — station browsing and playback formats
+
+- Page Radio Browser results in both directions with a bounded cache. Mark
+  **Start of results**, **End of results**, and **Only result** in the footer
+  when the selected row reaches a confirmed boundary.
+- Add direct AAC/HE-AAC, Ogg Opus/Vorbis, FLAC, and unencrypted audio-only HLS.
+  Resample lower-rate PCM to 48 kHz and distinguish permanent stream errors
+  from transient connection failures.
+- Add Vivid as a persisted LCD theme. Read legacy preferences on upgrade.
+- Run catalog writes on a storage worker and preserve shared NVS if startup
+  cannot initialize it. Restore the source release metadata.
+- All 20 regression scripts passed. BadgeLink readback matched the release
+  image, and the owner confirmed the audio formats, Vivid theme, and updated
+  search on Tanmatsu.
+
 ## 0.8.4 revision 15 — LED brightness
 
 - Add a saved brightness setting for Tanmatsu's RGB status LEDs. It defaults

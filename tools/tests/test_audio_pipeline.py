@@ -58,6 +58,7 @@ static void *radio_pcm_titles = (void *)4, *radio_station_mutex = (void *)5;
 static void *radio_task_handle = (void *)3;
 static bool radio_stop_requested, radio_exit_requested, radio_switch_requested, radio_resume_requested;
 static bool radio_output_ready, radio_buffering, radio_muted;
+static bool radio_input_ended;
 static bool locked, muted = true, fail_rate;
 static unsigned rate, writes;
 static uint8_t queue[2048], last_write[16];
@@ -100,11 +101,12 @@ static size_t xStreamBufferSend(void *s, const void *data, size_t size, unsigned
     memcpy(queue+queued,data,size); queued+=size; return size;
 }
 static size_t xStreamBufferReceive(void *s, void *data, size_t size, unsigned t) {
-    (void)t; assert(s && locked && queued >= size);
+    (void)t; assert(s && locked);
+    if (size > queued) size = queued;
     memcpy(data,queue,size); queued-=size; memmove(queue,queue+size,queued); return size;
 }
 static int audio_write_pcm(const void *data, size_t size) {
-    assert(locked && size == sizeof(last_write));
+    assert(locked && size && size <= sizeof(last_write) && size % 4 == 0);
     memcpy(last_write,data,size); writes++; return ESP_OK;
 }
 '''
@@ -140,6 +142,12 @@ int main(void) {
     radio_muted=true; memset(queue,2,64); queued=64; step();
     assert(muted && !radio_buffering); /* User mute survives buffer refill. */
     radio_discard_pcm(); assert(!queued && !radio_output_ready && muted);
+    radio_muted = false;
+    assert(radio_prepare_output(44100, 7) == ESP_OK);
+    queued = 12; radio_input_ended = true;
+    step(); assert(!queued && !muted); /* Final short buffer is audible. */
+    radio_discard_pcm(); assert(!radio_input_ended);
+    radio_muted = true;
     fail_rate=true;
     assert(radio_prepare_output(48000, 7)==ESP_FAIL && !radio_output_ready && muted);
     unsigned before=writes; radio_switch_requested=true; step(); assert(writes==before);

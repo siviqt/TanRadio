@@ -51,7 +51,7 @@ package: release
 	$(PYTHON) tools/package_release.py
 
 test:
-	@set -e; for check in app_startup network_startup audio_shutdown audio_gain audio_pcm audio_pipeline icy exit external_display now_playing_scroll about controls station_removal display_updates display_variants radio_browser ui_stack bsp_integration privacy; do \
+	@set -e; for check in app_startup network_startup audio_shutdown audio_gain audio_pcm audio_pipeline stream_formats icy exit external_display now_playing_scroll about controls station_removal display_updates display_variants radio_browser ui_stack bsp_integration privacy; do \
 	  $(PYTHON) "tools/tests/test_$$check.py"; \
 	done
 

@@ -11,11 +11,17 @@ enum {
     UI_LED_BRIGHTNESS_MAX = 100,
 };
 
+typedef enum {
+    UI_THEME_MIDNIGHT,
+    UI_THEME_VIVID,
+} ui_theme_t;
+
 typedef struct {
     external_display_id_t display;
     uint8_t contrast;
     bool online_logos;
     uint8_t led_brightness;
+    ui_theme_t theme;
 } ui_preferences_t;
 
 enum {
@@ -23,6 +29,7 @@ enum {
     UI_SETTING_CONTRAST,
     UI_SETTING_LOGOS,
     UI_SETTING_LED_BRIGHTNESS,
+    UI_SETTING_THEME,
     UI_SETTING_COUNT,
 };
 

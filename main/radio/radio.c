@@ -14,14 +14,16 @@
 /* Standard library */
 #include <stdint.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 /* ESP-IDF */
-#include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_audio_dec_default.h"
 #include "esp_audio_simple_dec.h"
 #include "esp_audio_simple_dec_default.h"
+#include "esp_aac_dec.h"
+#include "impl/esp_ts_dec.h"
 #include "esp_log.h"
 #include <stdlib.h>
 #include "esp_heap_caps.h"
@@ -39,6 +41,7 @@
 #include "audio/pcm.h"
 #include "radio/stations.h"
 #include "radio/browser.h"
+#include "radio/hls_stream.h"
 #include "freertos/semphr.h"
 #include "storage/sdcard.h"
 
@@ -55,13 +58,26 @@ static SemaphoreHandle_t radio_station_mutex;
 /* Serializes the PCM consumer with format changes and stream resets. */
 static SemaphoreHandle_t radio_output_mutex;
 static bool radio_output_ready;
-static atomic_int radio_audio_error; /* 0=none, 1=format, 2=output configuration */
+typedef enum {
+    RADIO_ERROR_NONE,
+    RADIO_ERROR_PCM,
+    RADIO_ERROR_OUTPUT,
+    RADIO_ERROR_FORMAT,
+    RADIO_ERROR_UNAVAILABLE,
+    RADIO_ERROR_TLS,
+    RADIO_ERROR_HLS,
+    RADIO_ERROR_DECODE,
+} radio_error_t;
+
+static atomic_int radio_audio_error;
 static radio_station_t radio_requested_station;
 static radio_station_t radio_current_station;
 
 #define RADIO_STREAM_BUFFER_SIZE 16384
 #define RADIO_COMPRESSED_BUFFER_SIZE (256 * 1024)
-#define RADIO_COMPRESSED_START_LEVEL (16 * 1024)
+#define RADIO_MAX_DECODE_BYTES (256 * 1024)
+#define RADIO_PROBE_MS 3000
+#define RADIO_FIRST_PCM_LIMIT (512 * 1024)
 #define RADIO_PCM_STREAM_BUFFER_SIZE (256 * 1024)
 #define RADIO_PCM_LOW_WATERMARK (32 * 1024)
 #define RADIO_PCM_HIGH_WATERMARK (160 * 1024)
@@ -83,6 +99,7 @@ static atomic_bool radio_stop_requested = true;
 static atomic_bool radio_resume_requested = false;
 static atomic_bool radio_muted = false;
 static atomic_bool radio_buffering = false;
+static atomic_bool radio_input_ended = false;
 
 typedef struct {
     uint64_t position;
@@ -98,12 +115,17 @@ typedef struct {
     char last_title[RADIO_TITLE_SIZE];
     atomic_bool stop_requested;
     atomic_bool finished;
+    atomic_bool playing_hls;
+    hls_stream_t *hls;
+    hls_stream_result_t hls_result;
+    stream_format_t mime;
     int result;
 } radio_download_context_t;
 
 typedef struct {
     radio_metadata_t metadata;
     uint32_t interval;
+    stream_format_t mime;
     bool interval_seen, interval_invalid;
 } radio_stream_headers_t;
 
@@ -125,10 +147,14 @@ static void radio_reset_metadata_locked(void)
 
 static esp_err_t radio_stream_header(esp_http_client_event_t *event)
 {
-    if (event->event_id != HTTP_EVENT_ON_HEADER) return ESP_OK;
     radio_stream_headers_t *headers = event->user_data;
+    /* Redirects supply a new set of headers. */
+    if (event->event_id == HTTP_EVENT_HEADERS_SENT) *headers = (radio_stream_headers_t){0};
+    if (event->event_id != HTTP_EVENT_ON_HEADER) return ESP_OK;
     const char *key = event->header_key, *value = event->header_value;
-    if (!strcasecmp(key, "icy-metaint")) {
+    if (!strcasecmp(key, "Content-Type")) {
+        headers->mime = stream_format_from_mime(value);
+    } else if (!strcasecmp(key, "icy-metaint")) {
         uint32_t interval;
         if (!icy_parse_uint(value, &interval) ||
             (headers->interval_seen && headers->interval != interval)) {
@@ -181,8 +207,15 @@ static bool radio_stream_interrupted(void)
            radio_stop_requested || radio_resume_requested;
 }
 
-static bool radio_download_active(const radio_download_context_t *context)
+static bool radio_connection_active(void *unused)
 {
+    (void)unused;
+    return !radio_stream_interrupted();
+}
+
+static bool radio_download_active(void *arg)
+{
+    const radio_download_context_t *context = arg;
     return !atomic_load(&context->stop_requested) && !radio_stream_interrupted();
 }
 
@@ -212,14 +245,35 @@ static void radio_download_task(void *arg)
 {
     radio_download_context_t *context = arg;
     context->result = -1;
+    size_t prefix = 0;
+    bool first = true;
     while (radio_download_active(context)) {
-        int count = esp_http_client_read(context->client, (char *)context->buffer,
-                                         RADIO_STREAM_BUFFER_SIZE);
+        int count = esp_http_client_read(context->client, (char *)context->buffer + prefix,
+                                         STREAM_HTTP_CHUNK - prefix);
         if (count <= 0) {
             context->result = count;
             break;
         }
-        if (!icy_filter_feed(context->icy, context->buffer, count,
+        size_t received = prefix + (size_t)count;
+        if (first && received < 8 && !esp_http_client_is_complete_data_received(context->client)) {
+            prefix = received;
+            continue;
+        }
+        if (first && !context->icy) {
+            stream_format_t format = stream_format_probe(context->buffer, received);
+            if (format == STREAM_PLAYLIST || (format == STREAM_UNKNOWN && context->mime == STREAM_PLAYLIST)) {
+                context->hls = hls_stream_create();
+                if (context->hls) {
+                    atomic_store(&context->playing_hls, true);
+                    context->hls_result = hls_stream_run(context->hls, context->client,
+                        context->buffer, received, radio_download_active, radio_download_audio, context);
+                }
+                break;
+            }
+        }
+        prefix = 0;
+        first = false;
+        if (!icy_filter_feed(context->icy, context->buffer, received,
                              radio_download_audio, radio_download_title, context)) break;
     }
     atomic_store(&context->finished, true);
@@ -281,8 +335,14 @@ static void radio_audio_step(uint8_t *pcm_chunk)
     }
     size_t available = xStreamBufferBytesAvailable(radio_pcm_stream);
 
+    bool input_ended = radio_input_ended;
+    if (input_ended && !available) {
+        memset(pcm_chunk, 0, RADIO_AUDIO_WRITE_CHUNK_SIZE);
+        audio_write_pcm(pcm_chunk, RADIO_AUDIO_WRITE_CHUNK_SIZE);
+        return;
+    }
     if (radio_buffering) {
-        if (available < RADIO_PCM_HIGH_WATERMARK) {
+        if (!input_ended && available < RADIO_PCM_HIGH_WATERMARK) {
             memset(pcm_chunk, 0, RADIO_AUDIO_WRITE_CHUNK_SIZE);
             audio_write_pcm(pcm_chunk, RADIO_AUDIO_WRITE_CHUNK_SIZE);
             return;
@@ -292,7 +352,7 @@ static void radio_audio_step(uint8_t *pcm_chunk)
         if (!radio_muted) {
             audio_unmute();
         }
-    } else if (available < RADIO_PCM_LOW_WATERMARK) {
+    } else if (!input_ended && available < RADIO_PCM_LOW_WATERMARK) {
         radio_set_buffering(true);
         audio_mute();
         memset(pcm_chunk, 0, RADIO_AUDIO_WRITE_CHUNK_SIZE);
@@ -394,10 +454,31 @@ static bool radio_queue_pcm(const uint8_t *data, size_t size, unsigned channels)
     return true;
 }
 
+static bool radio_queue_resampled(const uint8_t *data, size_t size, unsigned channels,
+                                  audio_pcm_resampler_t *resampler, uint64_t *position)
+{
+    const size_t stride = channels * sizeof(int16_t);
+    if (!stride || size % stride) return false;
+    int16_t stereo[64], converted[64 * 6];
+    while (size) {
+        size_t bytes = size < 32 * stride ? size : 32 * stride;
+        size_t frames = audio_pcm_stereo(data, bytes, channels, stereo, 32);
+        if (!frames) return false;
+        size_t output = audio_pcm_resample(resampler, stereo, frames, converted, 32 * 6) *
+                        2 * sizeof(int16_t);
+        if (!output || !radio_queue_stereo((const uint8_t *)converted, output)) return false;
+        *position += output;
+        data += bytes;
+        size -= bytes;
+    }
+    return true;
+}
+
 static void radio_discard_pcm(void)
 {
     if (radio_output_mutex) xSemaphoreTake(radio_output_mutex, portMAX_DELAY);
     radio_output_ready = false;
+    radio_input_ended = false;
     (void)audio_mute();
     if (radio_pcm_stream) xStreamBufferReset(radio_pcm_stream);
     if (radio_pcm_titles) xQueueReset(radio_pcm_titles);
@@ -420,6 +501,69 @@ static esp_err_t radio_prepare_output(uint32_t rate, uint32_t connection)
     return res;
 }
 
+static void radio_finish_stream(uint32_t connection, radio_error_t error)
+{
+    xSemaphoreTake(radio_station_mutex, portMAX_DELAY);
+    if (connection == radio_connection && !radio_stream_interrupted()) {
+        atomic_store(&radio_audio_error, error);
+        radio_stop_requested = true;
+        radio_set_buffering(false);
+    }
+    xSemaphoreGive(radio_station_mutex);
+}
+
+static radio_error_t radio_hls_error(const radio_download_context_t *context)
+{
+    switch (context->hls_result) {
+        case HLS_STREAM_UNSUPPORTED: return RADIO_ERROR_HLS;
+        case HLS_STREAM_UNAVAILABLE: return RADIO_ERROR_UNAVAILABLE;
+        case HLS_STREAM_TLS: return RADIO_ERROR_TLS;
+        default: return RADIO_ERROR_NONE;
+    }
+}
+
+static esp_audio_simple_dec_type_t radio_decoder_type(stream_format_t format)
+{
+    switch (format) {
+        case STREAM_MP3: return ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
+        case STREAM_AAC: return ESP_AUDIO_SIMPLE_DEC_TYPE_AAC;
+        case STREAM_OPUS:
+        case STREAM_OGG:
+        case STREAM_VORBIS: return ESP_AUDIO_SIMPLE_DEC_TYPE_OGG;
+        case STREAM_FLAC: return ESP_AUDIO_SIMPLE_DEC_TYPE_FLAC;
+        case STREAM_TS: return ESP_AUDIO_SIMPLE_DEC_TYPE_TS;
+        default: return ESP_AUDIO_SIMPLE_DEC_TYPE_NONE;
+    }
+}
+
+static stream_format_t radio_probe_stream(radio_download_context_t *context, uint8_t *input, size_t *size)
+{
+    TickType_t first_byte = 0;
+    while (*size < RADIO_STREAM_BUFFER_SIZE && !radio_stream_interrupted()) {
+        size_t received = xStreamBufferReceive(radio_compressed_stream, input + *size,
+            RADIO_STREAM_BUFFER_SIZE - *size, pdMS_TO_TICKS(250));
+        if (received) {
+            if (!*size) first_byte = xTaskGetTickCount();
+            *size += received;
+            stream_format_t format = stream_format_probe(input, *size);
+            if (format != STREAM_UNKNOWN) return format;
+        }
+        if ((atomic_load(&context->finished) && !xStreamBufferBytesAvailable(radio_compressed_stream)) ||
+            (*size && xTaskGetTickCount() - first_byte >= pdMS_TO_TICKS(RADIO_PROBE_MS))) break;
+    }
+    return STREAM_UNKNOWN;
+}
+
+static void radio_drain_output(void)
+{
+    radio_input_ended = true;
+    TickType_t start = xTaskGetTickCount();
+    while (!radio_stream_interrupted() && xStreamBufferBytesAvailable(radio_pcm_stream) &&
+           xTaskGetTickCount() - start < pdMS_TO_TICKS(2000)) vTaskDelay(pdMS_TO_TICKS(20));
+    /* Give the DMA buffer time to emit the final PCM after the queue empties. */
+    for (unsigned i = 0; i < 10 && !radio_stream_interrupted(); i++) vTaskDelay(pdMS_TO_TICKS(20));
+}
+
 /** Own the HTTP connection, decoder and the compressed-to-PCM timeline. */
 static void radio_stream_task(void *arg)
 {
@@ -428,6 +572,7 @@ static void radio_stream_task(void *arg)
     size_t station_index = radio_playing_station;
     radio_station_t stream_station;
     bool plain_retry = false;
+    unsigned retry_ms = 1000;
 
     while (true) {
         /*
@@ -435,6 +580,7 @@ static void radio_stream_task(void *arg)
          * alive. The task waits here until F4 clears the stop request.
          */
         if (radio_stop_requested && !radio_exit_requested) {
+            retry_ms = 1000;
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
@@ -453,6 +599,7 @@ static void radio_stream_task(void *arg)
         }
 
         if (radio_switch_requested) {
+            retry_ms = 1000;
             radio_set_buffering(true);
         }
 
@@ -488,9 +635,7 @@ static void radio_stream_task(void *arg)
         }
 
         ESP_LOGI(TAG,
-                 "Radio playback started: %s (%s)",
-                 station->name,
-                 station->url);
+                 "Radio playback started: %s", station->name);
         if (radio_exit_requested) {
             ESP_LOGI(TAG,
                      "Radio exit request received");
@@ -512,161 +657,11 @@ static void radio_stream_task(void *arg)
         bool audio_decoder_registered = false;
         bool simple_decoder_registered = false;
 
-        esp_http_client_config_t config = {
-            .url = station->url,
-            .timeout_ms = 3000,
-            .crt_bundle_attach = esp_crt_bundle_attach,
-            .buffer_size = RADIO_STREAM_BUFFER_SIZE,
-            .event_handler = radio_stream_header,
-            .user_data = &headers,
-        };
-
-        client = esp_http_client_init(&config);
-
-        if (client == NULL) {
-            ESP_LOGE(TAG, "Failed to initialize HTTP client");
-            goto reconnect;
-        }
-
-        esp_err_t res = esp_http_client_set_header(
-            client,
-            "User-Agent",
-            "TanRadio/0.1");
-
-        if (res != ESP_OK) {
-            ESP_LOGE(TAG,
-                     "Failed to set HTTP User-Agent: %s",
-                     esp_err_to_name(res));
-            goto stream_cleanup;
-        }
-
-        if (request_icy && esp_http_client_set_header(client, "Icy-MetaData", "1") != ESP_OK)
-            goto stream_cleanup;
-
-        /*
-         * The radio player uses the HTTP client's streaming API
-         * (open -> fetch_headers -> read), rather than
-         * esp_http_client_perform(). Automatic redirect handling is
-         * performed by esp_http_client_perform(), so it does not occur
-         * automatically in this streaming path.
-         */
-        enum {
-            RADIO_MAX_REDIRECTS = 10,
-        };
-
-        int redirect_count = 0;
-        int status_code = 0;
-        int64_t content_length = -1;
-
-        while (true) {
-            headers = (radio_stream_headers_t){0};
-            res = esp_http_client_open(client, 0);
-
-            if (res != ESP_OK) {
-                ESP_LOGE(TAG,
-                         "Failed to open radio stream: %s",
-                         esp_err_to_name(res));
-
-                if (esp_http_client_get_transport_type(client) ==
-                    HTTP_TRANSPORT_OVER_SSL) {
-                    int tls_error = 0;
-                    int tls_flags = 0;
-
-                    if (esp_http_client_get_and_clear_last_tls_error(
-                            client,
-                            &tls_error,
-                            &tls_flags) == ESP_OK) {
-                        ESP_LOGE(TAG,
-                                 "TLS diagnostics: error=0x%x flags=0x%x",
-                                 tls_error,
-                                 tls_flags);
-                    }
-                }
-
-                goto stream_cleanup;
-            }
-
-            content_length =
-                esp_http_client_fetch_headers(client);
-
-            if (content_length < 0) {
-                ESP_LOGE(TAG,
-                         "Failed to read HTTP response headers: %lld",
-                         (long long)content_length);
-                goto stream_cleanup;
-            }
-
-            status_code =
-                esp_http_client_get_status_code(client);
-
-            if (status_code == 301 ||
-                status_code == 302 ||
-                status_code == 303 ||
-                status_code == 307 ||
-                status_code == 308) {
-
-                if (redirect_count >= RADIO_MAX_REDIRECTS) {
-                    ESP_LOGE(TAG,
-                             "Radio redirect limit reached (%d)",
-                             RADIO_MAX_REDIRECTS);
-                    goto stream_cleanup;
-                }
-
-                /*
-                 * Location is stored internally by esp_http_client for
-                 * redirect processing. It is not obtained through
-                 * esp_http_client_get_response_header(), so the saved
-                 * response-header size limit does not truncate the
-                 * redirect URL used here.
-                 */
-                res = esp_http_client_close(client);
-
-                if (res != ESP_OK) {
-                    ESP_LOGE(TAG,
-                             "Failed to close redirected radio connection: %s",
-                             esp_err_to_name(res));
-                    goto stream_cleanup;
-                }
-
-                res = esp_http_client_clear_response_buffer(client);
-
-                if (res != ESP_OK) {
-                    ESP_LOGE(TAG,
-                             "Failed to clear redirected radio response buffer: %s",
-                             esp_err_to_name(res));
-                    goto stream_cleanup;
-                }
-
-                res = esp_http_client_set_redirection(client);
-
-                if (res != ESP_OK) {
-                    ESP_LOGE(TAG,
-                             "HTTP %d redirect did not provide a usable Location: %s",
-                             status_code,
-                             esp_err_to_name(res));
-                    goto stream_cleanup;
-                }
-
-                redirect_count++;
-
-                ESP_LOGI(TAG,
-                         "Following radio redirect %d/%d",
-                         redirect_count,
-                         RADIO_MAX_REDIRECTS);
-
-                continue;
-            }
-
-            break;
-        }
-
-        ESP_LOGI(TAG,
-                 "Radio stream connected: HTTP %d, content-length=%lld",
-                 status_code,
-                 (long long)content_length);
-
-        if (status_code < 200 || status_code >= 300) {
-            ESP_LOGE(TAG, "Radio server returned HTTP status %d", status_code);
+        stream_http_result_t opened = stream_http_open(&client, station->url, radio_stream_header,
+                                                         &headers, request_icy, radio_connection_active, NULL);
+        if (opened != STREAM_HTTP_OK) {
+            if (opened == STREAM_HTTP_UNAVAILABLE) radio_finish_stream(connection, RADIO_ERROR_UNAVAILABLE);
+            if (opened == STREAM_HTTP_TLS) radio_finish_stream(connection, RADIO_ERROR_TLS);
             goto stream_cleanup;
         }
 
@@ -675,6 +670,7 @@ static void radio_stream_task(void *arg)
             plain_retry = request_icy;
             goto stream_cleanup;
         }
+        download_context.mime = headers.mime;
         if (headers.interval) {
             download_context.icy = heap_caps_malloc(sizeof(*download_context.icy),
                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -690,47 +686,6 @@ static void radio_stream_task(void *arg)
             ++radio_metadata_revision;
         }
         xSemaphoreGive(radio_station_mutex);
-
-        esp_audio_simple_dec_cfg_t decoder_cfg = {
-            .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
-            .dec_cfg = NULL,
-            .cfg_size = 0,
-            .use_frame_dec = false,
-        };
-
-        esp_audio_err_t audio_res =
-            esp_audio_dec_register_default();
-
-        if (audio_res != ESP_AUDIO_ERR_OK) {
-            ESP_LOGE(TAG,
-                     "Failed to register audio decoders: %d",
-                     audio_res);
-            goto stream_cleanup;
-        }
-
-        audio_decoder_registered = true;
-
-        audio_res = esp_audio_simple_dec_register_default();
-
-        if (audio_res != ESP_AUDIO_ERR_OK) {
-            ESP_LOGE(TAG,
-                     "Failed to register simple audio decoders: %d",
-                     audio_res);
-            goto stream_cleanup;
-        }
-
-        simple_decoder_registered = true;
-
-        audio_res = esp_audio_simple_dec_open(
-            &decoder_cfg,
-            &decoder);
-
-        if (audio_res != ESP_AUDIO_ERR_OK || decoder == NULL) {
-            ESP_LOGE(TAG,
-                     "Failed to open MP3 decoder: %d",
-                     audio_res);
-            goto stream_cleanup;
-        }
 
         buffer = heap_caps_malloc(
             RADIO_STREAM_BUFFER_SIZE,
@@ -765,7 +720,7 @@ static void radio_stream_task(void *arg)
         BaseType_t download_task_res = xTaskCreate(
             radio_download_task,
             "tanradio_net",
-            4096,
+            8192,
             &download_context,
             5,
             &download_task_handle);
@@ -778,20 +733,67 @@ static void radio_stream_task(void *arg)
         radio_set_buffering(true);
         audio_mute();
 
-        while (xStreamBufferBytesAvailable(radio_compressed_stream) <
-                   RADIO_COMPRESSED_START_LEVEL &&
-               !atomic_load(&download_context.finished) &&
-               !radio_stream_interrupted()) {
-            vTaskDelay(pdMS_TO_TICKS(20));
+        size_t bytes_read = 0;
+        stream_format_t format = radio_probe_stream(&download_context, buffer, &bytes_read);
+        if (radio_stream_interrupted()) goto stream_cleanup;
+        if (atomic_load(&download_context.finished)) {
+            radio_error_t error = radio_hls_error(&download_context);
+            if (error) {
+                radio_finish_stream(connection, error);
+                goto stream_cleanup;
+            }
+        }
+        if (!bytes_read) goto stream_cleanup;
+        if (format == STREAM_UNKNOWN && !atomic_load(&download_context.playing_hls)) {
+            format = headers.mime;
+            if (format == STREAM_UNKNOWN) format = stream_format_from_codec(station->codec);
+        }
+        esp_audio_simple_dec_type_t decoder_type = radio_decoder_type(format);
+        if (decoder_type == ESP_AUDIO_SIMPLE_DEC_TYPE_NONE) {
+            radio_finish_stream(connection, format == STREAM_PLAYLIST ? RADIO_ERROR_HLS : RADIO_ERROR_FORMAT);
+            goto stream_cleanup;
+        }
+        const char *codec_name = stream_format_name(format);
+        bool hls = atomic_load(&download_context.playing_hls);
+        xSemaphoreTake(radio_station_mutex, portMAX_DELAY);
+        if (connection == radio_connection) {
+            snprintf(radio_metadata.format, sizeof(radio_metadata.format), "%s%s",
+                     hls && format != STREAM_TS ? "HLS " : "", codec_name);
+            ++radio_metadata_revision;
+        }
+        xSemaphoreGive(radio_station_mutex);
+
+        esp_aac_dec_cfg_t aac_cfg = ESP_AAC_DEC_CONFIG_DEFAULT();
+        aac_cfg.aac_plus_enable = true;
+        esp_ts_dec_cfg_t ts_cfg = {.aac_plus_enable = true};
+        esp_audio_simple_dec_cfg_t decoder_cfg = {.dec_type = decoder_type};
+        if (format == STREAM_AAC) {
+            decoder_cfg.dec_cfg = &aac_cfg;
+            decoder_cfg.cfg_size = sizeof(aac_cfg);
+        } else if (format == STREAM_TS) {
+            decoder_cfg.dec_cfg = &ts_cfg;
+            decoder_cfg.cfg_size = sizeof(ts_cfg);
         }
 
-        while (true) {
-            size_t bytes_read = xStreamBufferReceive(
-                radio_compressed_stream,
-                buffer,
-                RADIO_STREAM_BUFFER_SIZE,
-                pdMS_TO_TICKS(250));
+        esp_audio_err_t audio_res = esp_audio_dec_register_default();
+        if (audio_res != ESP_AUDIO_ERR_OK) goto stream_cleanup;
+        audio_decoder_registered = true;
+        audio_res = esp_audio_simple_dec_register_default();
+        if (audio_res != ESP_AUDIO_ERR_OK) goto stream_cleanup;
+        simple_decoder_registered = true;
+        audio_res = esp_audio_simple_dec_open(&decoder_cfg, &decoder);
+        if (audio_res != ESP_AUDIO_ERR_OK || !decoder) {
+            ESP_LOGE(TAG, "%s decoder open failed: %d", codec_name, audio_res);
+            if (audio_res != ESP_AUDIO_ERR_MEM_LACK) radio_finish_stream(connection, RADIO_ERROR_DECODE);
+            goto stream_cleanup;
+        }
 
+        audio_pcm_resampler_t resampler = {0};
+        while (true) {
+            if (!bytes_read) {
+                bytes_read = xStreamBufferReceive(radio_compressed_stream, buffer,
+                    RADIO_STREAM_BUFFER_SIZE, pdMS_TO_TICKS(250));
+            }
             if (bytes_read > 0) {
                 if (radio_exit_requested) {
                     ESP_LOGI(TAG,
@@ -818,12 +820,14 @@ static void radio_stream_task(void *arg)
                 esp_audio_simple_dec_raw_t raw = {
                     .buffer = buffer,
                     .len = (uint32_t)bytes_read,
-                    .eos = false,
+                    .eos = atomic_load(&download_context.finished) &&
+                           !xStreamBufferBytesAvailable(radio_compressed_stream),
                     .consumed = 0,
                     .frame_recover = ESP_AUDIO_SIMPLE_DEC_RECOVERY_NONE,
                 };
 
-                while (raw.len > 0) {
+                unsigned buffered_frames = 0;
+                while (raw.len > 0 && !radio_stream_interrupted()) {
                     esp_audio_simple_dec_out_t output = {
                         .buffer = pcm_buffer,
                         .len = pcm_buffer_size,
@@ -837,19 +841,20 @@ static void radio_stream_task(void *arg)
                         &output);
 
                     if (audio_res == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
-                        if (output.needed_size <= pcm_buffer_size) {
+                        if (output.needed_size <= pcm_buffer_size || output.needed_size > RADIO_MAX_DECODE_BYTES) {
                             ESP_LOGE(TAG,
-                                     "MP3 decoder reported invalid required output size: %lu",
-                                     (unsigned long)output.needed_size);
+                                     "%s decoder reported invalid required output size: %lu",
+                                     codec_name, (unsigned long)output.needed_size);
+                            radio_finish_stream(connection, RADIO_ERROR_DECODE);
                             goto stream_cleanup;
                         }
 
                         uint8_t *new_buffer =
-                            realloc(pcm_buffer, output.needed_size);
+                            heap_caps_realloc(pcm_buffer, output.needed_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 
                         if (new_buffer == NULL) {
                             ESP_LOGE(TAG,
-                                     "Failed to resize MP3 PCM output buffer to %lu bytes",
+                                     "Failed to resize PCM output buffer to %lu bytes",
                                      (unsigned long)output.needed_size);
                             goto stream_cleanup;
                         }
@@ -858,16 +863,16 @@ static void radio_stream_task(void *arg)
                         pcm_buffer_size = output.needed_size;
 
                         ESP_LOGI(TAG,
-                                 "MP3 PCM output buffer resized to %lu bytes",
+                                 "PCM output buffer resized to %lu bytes",
                                  (unsigned long)pcm_buffer_size);
 
                         continue;
                     }
 
-                    if (audio_res != ESP_AUDIO_ERR_OK) {
+                    if (audio_res != ESP_AUDIO_ERR_OK || raw.consumed > raw.len) {
                         ESP_LOGE(TAG,
-                                 "MP3 decode failed: %d",
-                                 audio_res);
+                                 "%s decode failed: %d", codec_name, audio_res);
+                        if (!decoded_frames) radio_finish_stream(connection, RADIO_ERROR_DECODE);
                         goto stream_cleanup;
                     }
 
@@ -880,60 +885,64 @@ static void radio_stream_task(void *arg)
                     if (output.decoded_size > 0) {
                         esp_audio_simple_dec_info_t info = {0};
                         audio_res = esp_audio_simple_dec_get_info(decoder, &info);
-                        if (audio_res != ESP_AUDIO_ERR_OK ||
-                            !audio_pcm_supported(info.sample_rate, info.bits_per_sample, info.channel)) {
+                        uint32_t rate = audio_pcm_output_rate(info.sample_rate, info.bits_per_sample, info.channel);
+                        if (audio_res != ESP_AUDIO_ERR_OK || !rate) {
                             ESP_LOGE(TAG, "Unsupported PCM: %lu Hz, %u bit, %u channels",
                                      (unsigned long)info.sample_rate, info.bits_per_sample, info.channel);
-                            atomic_store(&radio_audio_error, 1);
-                            radio_stop_requested = true;
-                            radio_set_buffering(false);
-                            audio_mute();
+                            radio_finish_stream(connection, RADIO_ERROR_PCM);
                             goto stream_cleanup;
                         }
                         if (!decoded_frames || info.sample_rate != output_format.sample_rate ||
                             info.bits_per_sample != output_format.bits_per_sample ||
                             info.channel != output_format.channel) {
-                            esp_err_t format_res = radio_prepare_output(info.sample_rate, connection);
+                            esp_err_t format_res = radio_prepare_output(rate, connection);
                             if (format_res != ESP_OK) {
                                 ESP_LOGE(TAG, "PCM configuration failed: %s", esp_err_to_name(format_res));
-                                atomic_store(&radio_audio_error, 2);
-                                radio_stop_requested = true;
-                                radio_set_buffering(false);
+                                radio_finish_stream(connection, RADIO_ERROR_OUTPUT);
                                 goto stream_cleanup;
                             }
                             queued_pcm_position = 0;
                             title_pending = have_title;
                             output_format = info;
-                            ESP_LOGI(TAG, "MP3 audio: %lu Hz, %u bit, %u channel, %lu bitrate",
-                                     (unsigned long)info.sample_rate, info.bits_per_sample,
-                                     info.channel, (unsigned long)info.bitrate);
+                            resampler = (audio_pcm_resampler_t){.input_rate = info.sample_rate};
+                            ESP_LOGI(TAG, "%s audio: %lu Hz to %lu Hz, %u bit, %u channel, stack margin %u",
+                                     codec_name, (unsigned long)info.sample_rate, (unsigned long)rate,
+                                     info.bits_per_sample, info.channel,
+                                     (unsigned)uxTaskGetStackHighWaterMark(NULL));
                         }
                         if (title_pending && radio_pcm_titles) {
                             next_title.position = queued_pcm_position;
                             title_pending = xQueueSend(radio_pcm_titles, &next_title, 0) != pdTRUE;
                         }
                         total_pcm_bytes += output.decoded_size;
-                        if (!radio_queue_pcm(output.buffer, output.decoded_size, info.channel))
+                        if (rate == info.sample_rate) {
+                            if (!radio_queue_pcm(output.buffer, output.decoded_size, info.channel))
+                                goto stream_cleanup;
+                            queued_pcm_position += output.decoded_size * (info.channel == 1 ? 2 : 1);
+                        } else if (!radio_queue_resampled(output.buffer, output.decoded_size,
+                                                          info.channel, &resampler, &queued_pcm_position)) {
                             goto stream_cleanup;
-                        queued_pcm_position += output.decoded_size * (info.channel == 1 ? 2 : 1);
+                        }
                         decoded_frames++;
+                        retry_ms = 1000;
                     }
 
                     if (raw.consumed == 0) {
-                        ESP_LOGW(TAG,
-                                 "MP3 decoder consumed no input");
-                        break;
+                        if (output.decoded_size && ++buffered_frames < 64) continue;
+                        ESP_LOGW(TAG, "%s decoder stalled", codec_name);
+                        if (!decoded_frames) radio_finish_stream(connection, RADIO_ERROR_DECODE);
+                        goto stream_cleanup;
                     }
 
+                    buffered_frames = 0;
                     raw.len -= raw.consumed;
                     raw.buffer += raw.consumed;
                     raw.consumed = 0;
                 }
 
-                if (raw.len != 0) {
-                    ESP_LOGW(TAG,
-                             "MP3 decoder left %lu input bytes unconsumed",
-                             (unsigned long)raw.len);
+                if (radio_stream_interrupted()) goto stream_cleanup;
+                if (!decoded_frames && total_bytes >= RADIO_FIRST_PCM_LIMIT) {
+                    radio_finish_stream(connection, RADIO_ERROR_DECODE);
                     goto stream_cleanup;
                 }
 
@@ -951,6 +960,7 @@ static void radio_stream_task(void *arg)
                     last_log_time = now;
                 }
 
+                bytes_read = 0;
                 continue;
             }
 
@@ -960,7 +970,13 @@ static void radio_stream_task(void *arg)
 
             if (atomic_load(&download_context.finished) &&
                 xStreamBufferBytesAvailable(radio_compressed_stream) == 0) {
-                if (download_context.result == 0) {
+                radio_error_t error = radio_hls_error(&download_context);
+                if (error) {
+                    radio_finish_stream(connection, error);
+                } else if (download_context.hls_result == HLS_STREAM_COMPLETE) {
+                    radio_drain_output();
+                    radio_finish_stream(connection, RADIO_ERROR_NONE);
+                } else if (download_context.result == 0) {
                     ESP_LOGW(TAG, "Radio stream closed by server");
                 } else {
                     ESP_LOGE(TAG,
@@ -992,6 +1008,7 @@ stream_cleanup:
 
         free(download_context.buffer);
         free(download_context.icy);
+        hls_stream_destroy(download_context.hls);
 
         xSemaphoreTake(radio_station_mutex, portMAX_DELAY);
         if (connection == radio_connection) radio_reset_metadata_locked();
@@ -1029,11 +1046,7 @@ stream_cleanup:
             pcm_buffer = NULL;
         }
 
-        if (client != NULL) {
-            esp_http_client_close(client);
-            esp_http_client_cleanup(client);
-            client = NULL;
-        }
+        stream_http_close(&client);
 
         if (radio_exit_requested) {
             ESP_LOGI(TAG,
@@ -1043,6 +1056,7 @@ stream_cleanup:
 
         if (radio_switch_requested || radio_resume_requested) {
             plain_retry = false;
+            retry_ms = 1000;
             radio_set_buffering(true);
             continue;
         }
@@ -1060,7 +1074,6 @@ stream_cleanup:
         }
         if (plain_retry) continue;
 
-reconnect:
         if (radio_exit_requested) {
             ESP_LOGI(TAG,
                      "Radio exit requested; skipping reconnect");
@@ -1071,9 +1084,10 @@ reconnect:
         audio_mute();
 
         ESP_LOGW(TAG,
-                 "Radio playback reconnecting in 2 seconds");
-
-        vTaskDelay(pdMS_TO_TICKS(2000));
+                 "Radio playback reconnecting in %u ms", retry_ms);
+        for (unsigned waited = 0; waited < retry_ms && !radio_stream_interrupted(); waited += 100)
+            vTaskDelay(pdMS_TO_TICKS(100));
+        if (retry_ms < 16000) retry_ms *= 2;
     }
 
     radio_task_handle = NULL;
@@ -1157,10 +1171,14 @@ size_t radio_station_get_selected(void)
     return radio_selected_station;
 }
 
-void radio_catalog_changed(void)
+void radio_apply_catalog_removal(size_t index)
 {
-    if (!radio_station_mutex) return;
+    if (!radio_station_mutex) {
+        stations_publish_removal(index);
+        return;
+    }
     xSemaphoreTake(radio_station_mutex, portMAX_DELAY);
+    stations_publish_removal(index);
     radio_selected_station = SIZE_MAX;
     radio_playing_station = SIZE_MAX;
     stations_find(&radio_requested_station, &radio_selected_station);
@@ -1184,26 +1202,28 @@ size_t radio_station_get_playing(void)
  */
 bool radio_station_select(size_t index)
 {
-    const radio_station_t *station = stations_get(index);
-    if (station == NULL || radio_station_mutex == NULL) {
+    if (!radio_station_mutex) return false;
+    xSemaphoreTake(radio_station_mutex, portMAX_DELAY);
+    const radio_station_t *saved = stations_get(index);
+    if (!saved) {
+        xSemaphoreGive(radio_station_mutex);
         return false;
     }
-
-    xSemaphoreTake(radio_station_mutex, portMAX_DELAY);
-    bool changed = !stations_same(&radio_requested_station, station);
-    radio_requested_station = *station;
+    radio_station_t station = *saved;
+    bool changed = !stations_same(&radio_requested_station, &station);
+    radio_requested_station = station;
     radio_selected_station = index;
     bool switching = radio_task_handle != NULL && !radio_stop_requested && changed;
     if (switching) {
         radio_switch_requested = true;
         radio_reset_metadata_locked();
-        radio_current_station = *station;
+        radio_current_station = station;
         radio_playing_station = index;
     }
     xSemaphoreGive(radio_station_mutex);
 
     if (switching) {
-        radio_browser_count_play(station->stationuuid);
+        radio_browser_count_play(station.stationuuid);
         radio_set_buffering(true);
 
         esp_err_t mute_res = audio_mute();
@@ -1217,8 +1237,8 @@ bool radio_station_select(size_t index)
         ESP_LOGI(
             TAG,
             "Radio station switch requested: %zu (%s)",
-            radio_selected_station,
-            radio_station_get_name(radio_selected_station));
+            index,
+            station.name);
     }
 
     return true;
@@ -1235,8 +1255,7 @@ bool radio_get_playing_station(radio_station_t *station)
 
 bool radio_play_preview(const radio_station_t *station)
 {
-    return stations_valid(station) && strcmp(station->codec, "MP3") == 0 &&
-           radio_play_record(station);
+    return radio_play_record(station);
 }
 
 static void radio_copy_playback_locked(radio_playback_status_t *status)
@@ -1272,8 +1291,8 @@ bool radio_play_record(const radio_station_t *station)
 {
     if (!radio_task_handle || !stations_valid(station)) return false;
     size_t index = SIZE_MAX;
-    stations_find(station, &index);
     xSemaphoreTake(radio_station_mutex, portMAX_DELAY);
+    stations_find(station, &index);
     bool switching = !radio_stop_requested &&
                      !stations_same(&radio_requested_station, station);
     radio_requested_station = *station;
@@ -1353,10 +1372,6 @@ bool radio_play(void)
     if (radio_pcm_stream != NULL) {
         radio_discard_pcm();
     }
-    if (radio_compressed_stream != NULL) {
-        xStreamBufferReset(radio_compressed_stream);
-    }
-
     xSemaphoreTake(radio_station_mutex, portMAX_DELAY);
     radio_playing_station = radio_selected_station;
     radio_current_station = radio_requested_station;
@@ -1419,10 +1434,6 @@ bool radio_stop(void)
     if (radio_pcm_stream != NULL) {
         radio_discard_pcm();
     }
-    if (radio_compressed_stream != NULL) {
-        xStreamBufferReset(radio_compressed_stream);
-    }
-
     ESP_LOGI(
         TAG,
         "Radio playback stop requested");
@@ -1641,7 +1652,7 @@ void radio_init(void)
     BaseType_t task_res = xTaskCreate(
         radio_stream_task,
         "tanradio_radio",
-        8192,
+        20 * 1024,
         NULL,
         5,
         &radio_task_handle);
@@ -1662,8 +1673,13 @@ void radio_init(void)
 const char *radio_get_audio_error(void)
 {
     switch (atomic_load(&radio_audio_error)) {
-        case 1: return "Unsupported audio format";
-        case 2: return "Audio output error";
+        case RADIO_ERROR_PCM: return "Unsupported sample rate, depth or channel count";
+        case RADIO_ERROR_OUTPUT: return "Audio output error";
+        case RADIO_ERROR_FORMAT: return "Unsupported stream format";
+        case RADIO_ERROR_UNAVAILABLE: return "Station unavailable";
+        case RADIO_ERROR_TLS: return "Station certificate could not be verified";
+        case RADIO_ERROR_HLS: return "Unsupported HLS playlist";
+        case RADIO_ERROR_DECODE: return "Could not decode this station";
         default: return NULL;
     }
 }

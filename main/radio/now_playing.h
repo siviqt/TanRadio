@@ -9,6 +9,7 @@ typedef struct {
     char name[97];
     char genre[64];
     char description[160];
+    char format[16];
     uint16_t bitrate_kbps;
 } radio_metadata_t;
 

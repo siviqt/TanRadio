@@ -1,4 +1,5 @@
 #include "radio/browser_parse.h"
+#include "radio/stream_format.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -19,14 +20,16 @@ static bool number_is(const cJSON *object, const char *key, double number)
 }
 
 bool browser_parse_stations(const char *json, radio_station_t *results,
-                             size_t capacity, size_t *count)
+                            size_t capacity, size_t *count, size_t *raw_count)
 {
     *count = 0;
+    if (raw_count) *raw_count = 0;
     cJSON *root = cJSON_ParseWithOpts(json, NULL, true);
     if (!cJSON_IsArray(root)) {
         cJSON_Delete(root);
         return false;
     }
+    if (raw_count) *raw_count = (size_t)cJSON_GetArraySize(root);
     const cJSON *item;
     cJSON_ArrayForEach(item, root) {
         if (*count >= capacity) break;
@@ -35,8 +38,10 @@ bool browser_parse_stations(const char *json, radio_station_t *results,
         const char *country = string_field(item, "countrycode");
         const char *codec = string_field(item, "codec");
         const char *uuid = string_field(item, "stationuuid");
-        /* Do not guess at raw playlist URLs or missing compatibility data. */
-        if (strcmp(codec, "MP3") != 0 || !number_is(item, "hls", 0) ||
+        stream_format_t format = stream_format_from_codec(codec);
+        bool direct = number_is(item, "hls", 0) && format != STREAM_UNKNOWN;
+        bool hls = number_is(item, "hls", 1) && (format == STREAM_AAC || format == STREAM_MP3);
+        if ((!direct && !hls) ||
             !number_is(item, "lastcheckok", 1) || !stations_uuid_valid(uuid) ||
             strlen(name) > STATIONS_MAX_NAME_LENGTH ||
             strlen(url) > STATIONS_MAX_URL_LENGTH || strlen(country) > 2) {

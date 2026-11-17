@@ -22,23 +22,41 @@
 
 #define SEARCH_BODY_LIMIT (96 * 1024)
 #define REQUEST_DEADLINE_US (12LL * 1000000)
+#define BROWSER_CACHE_PAGES 3
+#define BROWSER_PREFETCH_ROWS 3
 static const char *TAG = "tanradio.browser";
 
 typedef struct {
     unsigned generation; /* Zero denotes a best-effort playback click. */
     char query[BROWSER_QUERY_LENGTH + 1];
     radio_browser_search_mode_t mode;
+    size_t offset;
+    int direction;
+    bool retry;
 } browser_job_t;
+
+typedef struct {
+    size_t offset;
+    size_t count;
+    radio_station_t rows[BROWSER_PAGE_SIZE];
+} browser_page_t;
 
 static QueueHandle_t jobs;
 static SemaphoreHandle_t mutex;
-static radio_station_t *results;
+static browser_page_t *results;
+/* Viewport and cached pages are published together under the browser mutex. */
+static browser_page_t *pages[BROWSER_CACHE_PAGES];
+static size_t page_count, selection, first_offset, next_offset;
+static bool exhausted, step_after_load;
+static browser_job_t active_search, pending_page;
 static radio_browser_status_t status;
 static unsigned generation = 1;
 /* Only the browser worker accesses the mirror cache. */
 static char mirrors[BROWSER_MIRROR_LIMIT][BROWSER_HOST_LENGTH];
 static size_t mirror_count;
 static int64_t mirrors_expire;
+static char search_mirror[BROWSER_HOST_LENGTH];
+static unsigned mirror_generation;
 
 typedef enum {
     BROWSER_FAILURE_CONNECT,
@@ -195,17 +213,158 @@ done:
     return ok && !cancelled(request);
 }
 
-static void finish_search(unsigned request, const radio_station_t *found,
-                           size_t count, const char *message)
+static void search_message_locked(const char *message)
+{
+    status.revision++;
+    snprintf(status.message, sizeof(status.message), "%s", message);
+}
+
+static void search_failure_locked(const char *message)
+{
+    status.busy = false;
+    status.can_retry = true;
+    search_message_locked(message);
+}
+
+static void fail_page(unsigned request, const char *message)
+{
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    if (request == generation) search_failure_locked(message);
+    xSemaphoreGive(mutex);
+}
+
+static void request_new_mirror(unsigned request)
 {
     xSemaphoreTake(mutex, portMAX_DELAY);
     if (request == generation) {
-        if (found && count) memcpy(results, found, count * sizeof(*results));
-        status.count = count;
-        status.busy = false;
-        status.revision++;
-        snprintf(status.message, sizeof(status.message), "%s", message);
+        status.busy = status.can_retry = false;
+        search_message_locked("Directory mirror unavailable. Press Enter to start a new search.");
     }
+    xSemaphoreGive(mutex);
+}
+
+static void clear_pages_locked(void)
+{
+    for (size_t i = 0; i < BROWSER_CACHE_PAGES; i++) pages[i] = results + i;
+    page_count = selection = first_offset = next_offset = status.count = 0;
+    exhausted = step_after_load = status.busy = status.can_retry = false;
+}
+
+static bool queue_page_locked(browser_job_t job, bool priority)
+{
+    pending_page = job;
+    status.busy = true;
+    status.can_retry = false;
+    search_message_locked(!status.count ? "Searching Radio Browser..." :
+                          job.direction < 0 ? "Loading earlier stations..." : "Loading more stations...");
+    BaseType_t queued = priority ? xQueueSendToFront(jobs, &job, 0) : xQueueSendToBack(jobs, &job, 0);
+    if (queued == pdTRUE) return true;
+    search_failure_locked("Directory is busy. Press Enter to retry.");
+    return false;
+}
+
+static void ready_message_locked(void)
+{
+    search_message_locked(status.count ? "" : "No compatible stations found.");
+}
+
+static bool can_cache_page_locked(int direction)
+{
+    if (page_count < BROWSER_CACHE_PAGES) return true;
+    return direction < 0 ? selection < status.count - pages[page_count - 1]->count :
+                           selection >= pages[0]->count;
+}
+
+static const radio_station_t *result_locked(size_t index)
+{
+    for (size_t i = 0; i < page_count; i++) {
+        if (index < pages[i]->count) return &pages[i]->rows[index];
+        index -= pages[i]->count;
+    }
+    return NULL;
+}
+
+static bool already_cached_locked(const radio_station_t *station)
+{
+    for (size_t i = 0; i < page_count; i++) {
+        for (size_t row = 0; row < pages[i]->count; row++) {
+            if (stations_same(station, &pages[i]->rows[row])) return true;
+        }
+    }
+    return false;
+}
+
+static void evict_page_locked(bool before)
+{
+    if (before) {
+        browser_page_t *first = pages[0];
+        selection -= first->count;
+        status.count -= first->count;
+        --page_count;
+        memmove(pages, pages + 1, page_count * sizeof(*pages));
+        pages[page_count] = first;
+        first_offset = pages[0]->offset;
+    } else {
+        browser_page_t *last = pages[--page_count];
+        status.count -= last->count;
+        next_offset = last->offset;
+        exhausted = false;
+    }
+}
+
+static void publish_page(const browser_job_t *job, radio_station_t *found,
+                         size_t count, size_t raw_count)
+{
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    if (job->generation != generation) goto done;
+    status.busy = false;
+    bool before = job->direction < 0;
+    size_t accepted = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (already_cached_locked(&found[i])) continue;
+        if (accepted != i) found[accepted] = found[i];
+        accepted++;
+    }
+    /* The user may have moved into the page that would be evicted while an
+     * optional prefetch was in flight. Keep the selection and fetch again later. */
+    if (accepted && !can_cache_page_locked(job->direction)) {
+        step_after_load = false;
+        ready_message_locked();
+        goto done;
+    }
+    if (before) {
+        first_offset = job->offset;
+    } else {
+        next_offset = job->offset + raw_count;
+        exhausted = raw_count < BROWSER_PAGE_SIZE;
+    }
+    if (accepted) {
+        if (page_count == BROWSER_CACHE_PAGES) evict_page_locked(!before);
+        browser_page_t *page = pages[page_count];
+        page->offset = job->offset;
+        page->count = accepted;
+        memcpy(page->rows, found, accepted * sizeof(*found));
+        if (before) {
+            memmove(pages + 1, pages, page_count * sizeof(*pages));
+            pages[0] = page;
+            selection += accepted;
+            if (step_after_load && selection == accepted) selection--;
+        } else if (step_after_load && status.count && selection + 1 == status.count) {
+            selection++;
+        }
+        page_count++;
+        status.count += accepted;
+    } else if (before ? first_offset != 0 : !exhausted) {
+        browser_job_t next = *job;
+        next.direction = before ? -1 : 1;
+        next.offset = before ? first_offset - BROWSER_PAGE_SIZE : next_offset;
+        next.retry = false;
+        queue_page_locked(next, false);
+        goto done;
+    }
+    step_after_load = false;
+    ready_message_locked();
+done:
     xSemaphoreGive(mutex);
 }
 
@@ -216,21 +375,25 @@ static void browser_worker(void *arg)
     while (xQueueReceive(jobs, &job, portMAX_DELAY) == pdTRUE) {
         if (cancelled(job.generation)) continue;
         if (!network_is_connected()) {
-            if (job.generation) finish_search(job.generation, NULL, 0, "Connect to Wi-Fi, then press Enter to retry.");
+            if (job.generation) fail_page(job.generation, "Connect to Wi-Fi, then press Enter to retry.");
             continue;
         }
-        if (!mirror_count || esp_timer_get_time() >= mirrors_expire) {
+        bool pinned = job.generation && job.generation == mirror_generation;
+        if (!pinned && (!mirror_count || esp_timer_get_time() >= mirrors_expire)) {
             mirror_count = discover_mirrors(job.generation, mirrors);
             mirrors_expire = esp_timer_get_time() + 30LL * 60 * 1000000;
         }
-        if (!mirror_count) {
-            if (job.generation) finish_search(job.generation, NULL, 0, "Directory discovery failed. Press Enter to retry.");
+        if (!pinned && !mirror_count) {
+            if (job.generation) fail_page(job.generation, "Directory discovery failed. Press Enter to retry.");
             continue;
         }
         char encoded[BROWSER_QUERY_LENGTH * 3 + 1];
         char path[480];
         if (job.generation) {
-            if (!browser_encode_query(job.query, encoded, sizeof(encoded))) continue;
+            if (!browser_encode_query(job.query, encoded, sizeof(encoded))) {
+                fail_page(job.generation, "Search term is too long.");
+                continue;
+            }
             const char *field = "name";
             if (job.mode == BROWSER_SEARCH_COUNTRY) {
                 field = "country";
@@ -242,51 +405,59 @@ static void browser_worker(void *arg)
                     encoded[2] = 0;
                 }
             }
-            snprintf(path, sizeof(path), "/json/stations/search?%s=%s&codec=MP3&hidebroken=true"
-                     "&limit=%d&order=clickcount&reverse=true", field, encoded, BROWSER_RESULT_LIMIT);
+            snprintf(path, sizeof(path), "/json/stations/search?%s=%s&hidebroken=true"
+                     "&limit=%d&offset=%zu&order=name", field, encoded, BROWSER_PAGE_SIZE, job.offset);
         } else {
             snprintf(path, sizeof(path), "/json/url/%s", job.query);
         }
         size_t capacity = job.generation ? SEARCH_BODY_LIMIT + 1 : 2048;
         char *body = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         radio_station_t *found = job.generation ? heap_caps_calloc(
-            BROWSER_RESULT_LIMIT, sizeof(*found), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : NULL;
+            BROWSER_PAGE_SIZE, sizeof(*found), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) : NULL;
         bool success = false;
-        size_t count = 0;
+        size_t count = 0, raw_count = 0;
         browser_failure_t failure = BROWSER_FAILURE_RESPONSE;
         if (body && (!job.generation || found)) {
-            for (size_t i = 0; i < mirror_count && i < 3 && !cancelled(job.generation); i++) {
-                bool received = request_json(mirrors[i], path, job.generation, body, capacity, &failure);
+            size_t attempts = pinned ? 1 : mirror_count;
+            for (size_t i = 0; i < attempts && i < 3 && !cancelled(job.generation); i++) {
+                const char *host = pinned ? search_mirror : mirrors[i];
+                bool received = request_json(host, path, job.generation, body, capacity, &failure);
                 /* Discovery can contain only one server. Give a transient
                  * reset one bounded retry instead of requiring another Enter.
                  * Click notifications are best effort and are never retried. */
-                if (!received && job.generation && mirror_count == 1 &&
+                if (!received && job.generation && attempts == 1 &&
                     failure == BROWSER_FAILURE_CONNECT && !cancelled(job.generation)) {
                     ESP_LOGI(TAG, "Retrying single directory mirror after connection failure");
                     vTaskDelay(pdMS_TO_TICKS(200));
                     if (!cancelled(job.generation)) {
-                        received = request_json(mirrors[i], path, job.generation, body, capacity, &failure);
+                        received = request_json(host, path, job.generation, body, capacity, &failure);
                     }
                 }
                 if (!received) continue;
-                if (!job.generation || browser_parse_stations(body, found, BROWSER_RESULT_LIMIT, &count)) {
+                if (!job.generation ||
+                    (browser_parse_stations(body, found, BROWSER_PAGE_SIZE, &count, &raw_count) &&
+                     raw_count <= BROWSER_PAGE_SIZE && job.offset <= SIZE_MAX - raw_count)) {
+                    if (job.generation && !pinned) {
+                        snprintf(search_mirror, sizeof(search_mirror), "%s", host);
+                        mirror_generation = job.generation;
+                    }
                     success = true;
                     break;
                 }
                 failure = BROWSER_FAILURE_RESPONSE;
-                ESP_LOGW(TAG, "Directory %s returned invalid station JSON", mirrors[i]);
+                ESP_LOGW(TAG, "Directory %s returned an invalid station page", host);
             }
         }
-        if (job.generation) {
+        if (job.generation && success) {
+            publish_page(&job, found, count, raw_count);
+        } else if (pinned && job.retry && failure == BROWSER_FAILURE_CONNECT) {
+            request_new_mirror(job.generation);
+        } else if (job.generation) {
             const char *message = !body || !found ? "Not enough memory. Try again after stopping playback." :
-                !success ? (failure == BROWSER_FAILURE_CONNECT ?
-                    "Directory connection failed. Press Enter to retry." :
-                    failure == BROWSER_FAILURE_SIZE ?
-                    "Directory response too large. Refine the search." :
-                    "Directory response failed. Press Enter to retry.") :
-                !count ? "No compatible stations found. Try another name or country." :
-                "MP3 results (up to 20). Type to change your search.";
-            finish_search(job.generation, found, success ? count : 0, message);
+                failure == BROWSER_FAILURE_CONNECT ? "Directory connection failed. Press Enter to retry." :
+                failure == BROWSER_FAILURE_SIZE ? "Directory response too large. Refine the search." :
+                "Directory response failed. Press Enter to retry.";
+            fail_page(job.generation, message);
         }
         if (!success && !cancelled(job.generation)) mirror_count = 0;
         free(found);
@@ -299,7 +470,7 @@ void radio_browser_init(void)
 {
     if (jobs) return;
     mutex = xSemaphoreCreateMutex();
-    results = heap_caps_calloc(BROWSER_RESULT_LIMIT, sizeof(*results),
+    results = heap_caps_calloc(BROWSER_CACHE_PAGES, sizeof(*results),
                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     QueueHandle_t queue = xQueueCreate(8, sizeof(browser_job_t));
     if (!mutex || !results || !queue) {
@@ -339,14 +510,11 @@ bool radio_browser_search_by(const char *query, radio_browser_search_mode_t mode
     memcpy(job.query, query, length);
     xSemaphoreTake(mutex, portMAX_DELAY);
     job.generation = next_generation();
-    status.busy = true;
-    status.count = 0;
-    status.revision++;
-    snprintf(status.message, sizeof(status.message), "Searching Radio Browser...");
+    clear_pages_locked();
+    active_search = job;
+    bool queued = queue_page_locked(job, true);
     xSemaphoreGive(mutex);
-    if (xQueueSendToFront(jobs, &job, 0) == pdTRUE) return true;
-    finish_search(job.generation, NULL, 0, "Directory is busy. Press Enter to retry.");
-    return false;
+    return queued;
 }
 
 void radio_browser_cancel(void)
@@ -354,11 +522,16 @@ void radio_browser_cancel(void)
     if (!mutex) return;
     xSemaphoreTake(mutex, portMAX_DELAY);
     next_generation();
-    status.busy = false;
-    status.count = 0;
-    status.revision++;
-    snprintf(status.message, sizeof(status.message), "Type a name or country; Tab changes mode.");
+    clear_pages_locked();
+    search_message_locked("Type a name or country; Tab changes mode.");
     xSemaphoreGive(mutex);
+}
+
+static void snapshot_status_locked(radio_browser_status_t *out)
+{
+    *out = status;
+    out->at_start = status.count > 0 && first_offset == 0 && selection == 0;
+    out->at_end = status.count > 0 && exhausted && selection == status.count - 1;
 }
 
 void radio_browser_status(radio_browser_status_t *out)
@@ -369,7 +542,7 @@ void radio_browser_status(radio_browser_status_t *out)
         return;
     }
     xSemaphoreTake(mutex, portMAX_DELAY);
-    *out = status;
+    snapshot_status_locked(out);
     xSemaphoreGive(mutex);
 }
 
@@ -377,10 +550,82 @@ bool radio_browser_result(size_t index, radio_station_t *station)
 {
     if (!mutex || !station) return false;
     xSemaphoreTake(mutex, portMAX_DELAY);
-    bool valid = index < status.count && !status.busy;
-    if (valid) *station = results[index];
+    const radio_station_t *result = result_locked(index);
+    if (result) *station = *result;
     xSemaphoreGive(mutex);
-    return valid;
+    return result != NULL;
+}
+
+bool radio_browser_selected(radio_station_t *station)
+{
+    if (!mutex || !station) return false;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    const radio_station_t *result = result_locked(selection);
+    if (result) *station = *result;
+    xSemaphoreGive(mutex);
+    return result != NULL;
+}
+
+size_t radio_browser_window(radio_browser_status_t *out, radio_station_t *rows,
+                            size_t capacity, size_t *selected_row)
+{
+    *selected_row = SIZE_MAX;
+    if (!mutex) {
+        radio_browser_status(out);
+        return 0;
+    }
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    snapshot_status_locked(out);
+    size_t count = status.count < capacity ? status.count : capacity;
+    if (count) {
+        size_t first = selection > capacity / 2 ? selection - capacity / 2 : 0;
+        if (first > status.count - count) first = status.count - count;
+        *selected_row = selection - first;
+        for (size_t i = 0; i < count; i++) rows[i] = *result_locked(first + i);
+    }
+    xSemaphoreGive(mutex);
+    return count;
+}
+
+void radio_browser_move(int direction)
+{
+    if (!mutex || !direction) return;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    if (!status.count) goto done;
+    bool before = direction < 0;
+    bool at_edge = before ? selection == 0 : selection + 1 == status.count;
+    if (!at_edge) selection = before ? selection - 1 : selection + 1;
+    if (status.busy) {
+        if (at_edge && pending_page.direction == direction) step_after_load = true;
+    } else if (!status.can_retry) {
+        size_t distance = before ? selection : status.count - 1 - selection;
+        if (distance < BROWSER_PREFETCH_ROWS && (before ? first_offset != 0 : !exhausted) &&
+            can_cache_page_locked(direction)) {
+            browser_job_t job = active_search;
+            job.direction = direction;
+            job.offset = before ? first_offset - BROWSER_PAGE_SIZE : next_offset;
+            step_after_load = at_edge;
+            queue_page_locked(job, true);
+        } else {
+            ready_message_locked();
+        }
+    }
+done:
+    xSemaphoreGive(mutex);
+}
+
+bool radio_browser_retry(void)
+{
+    if (!mutex) return false;
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    bool retry = status.can_retry && !status.busy;
+    if (retry) {
+        browser_job_t job = pending_page;
+        job.retry = true;
+        queue_page_locked(job, true);
+    }
+    xSemaphoreGive(mutex);
+    return retry;
 }
 
 void radio_browser_count_play(const char *uuid)

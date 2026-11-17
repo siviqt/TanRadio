@@ -39,15 +39,15 @@ bool stations_uuid_valid(const char *uuid);
 bool stations_same(const radio_station_t *left, const radio_station_t *right);
 bool stations_find(const radio_station_t *station, size_t *index);
 
-/* Called by the input task. Append without replacing any published records.
+/* Called by the catalog writer. Append without replacing any published records.
  * Duplicate UUIDs/URLs return their existing index without touching the file. */
 esp_err_t stations_save(const char *path, const radio_station_t *station,
                         size_t *index, bool *already_saved);
 
-/* Input task only, under ui_mutex to exclude catalog readers. Preserve all
- * other file bytes and compact the catalog only after the SD update succeeds.
- * Catalog pointers/indices can change; playback must own its station record. */
-esp_err_t stations_remove(const char *path, size_t index);
+/* The catalog writer commits the file first, then publishes the removal with
+ * catalog readers excluded. The writer serializes both steps with saves. */
+esp_err_t stations_remove_file(const char *path, size_t index);
+void stations_publish_removal(size_t index);
 
 size_t stations_count(void);
 const radio_station_t *stations_get(size_t index);

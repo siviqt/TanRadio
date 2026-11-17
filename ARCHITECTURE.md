@@ -61,8 +61,9 @@ changes. Normal shutdown flushes pending levels. Missing/invalid settings retain
 50%. The BSP scales public volume by 0.70 and reverses scaling on readback,
 retaining shared-bus serialization and a maximum codec register value of 0xB3.
 
-The decoder validates every PCM frame's format before queuing it. Supported
-formats are signed 16-bit mono/stereo at 44.1/48 kHz; mono samples are duplicated.
+The decoder validates each PCM frame before queuing it. Signed 16-bit
+mono/stereo PCM plays at native 44.1 or 48 kHz. Other accepted rates from
+8 to 48 kHz are resampled to 48 kHz. Mono samples are duplicated.
 A pipeline mutex serializes output consumption, queue resets and format changes.
 Transitions mute and discard old queued samples, clock two DMA rings of silence,
 and disable/reconfigure/re-enable I2S when its rate changes. Output stays muted
@@ -77,18 +78,29 @@ JSON depth, DNS SRV mirror discovery and cancellation. Failed directory requests
 do not interrupt playback or replace the saved catalog. Search connection errors
 retry another mirror; with only one mirror they retry once after 200 ms. Socket
 operations allow five seconds. Click notifications are best effort and never
-block playback. Remote TLS resets can still require a later manual search retry.
+block playback. Search keeps three 20-row pages in PSRAM. A moving viewport
+prefetches in the direction of travel and refetches evicted pages on reverse
+scroll. The cursor advances by raw API rows even when filtering removes all
+rows on a page. Pages use name order on a single mirror per search, with UUID
+and URL deduplication across cached results. The viewport snapshot includes
+whether the highlighted result is at either confirmed boundary. The footer
+uses those flags while loading and retry messages have their own status line.
 
 The SD catalog is `/tanradio/stations.txt`. New catalogs are empty. Saves preserve
 existing records/comments and prevent UUID/URL duplicates. A temporary file and
-backup protect replacements and support interrupted-save recovery. Removal
+backup protect replacements and support interrupted-save recovery. A catalog
+worker performs SD saves and removals outside UI and playback locks. Removal
 commits the file before changing the in-memory catalog. Removing the active
 station preserves playback as a selectable Preview. Catalog compaction and UI
 readers are serialized; indices are rebased without reconnecting the stream.
 
 ## Now Playing and external displays
 
-The HTTP download task strips ICY framing before forwarding MP3 bytes.
+The HTTP download task strips ICY framing from direct streams. The decoder
+selects MP3, AAC, Ogg, FLAC, or MPEG-TS from a bounded probe. Audio-only HLS
+resolves the selected playlist and its segment URLs, then feeds media in
+sequence through the same compressed and PCM buffers. A live discontinuity
+causes a reconnect and decoder reset.
 A bounded queue associates each changed title with its compressed byte
 position. The decoder maps that position to the next corresponding PCM
 frame. The output task publishes the title after that PCM reaches I2S.
@@ -159,11 +171,12 @@ Do not replace these components with
 registry copies or edit generated copies in `managed_components/`.
 `dependencies.lock` pins downloaded components; ESP-IDF regenerates their cache.
 
-`sdkconfig_tanmatsu` is the production configuration; `sdkconfigs/` supplies
-reproducible defaults. Keep both. `make build` writes to `build/tanmatsu` and
-ESP-IDF populates `managed_components/`. `make release` generates the AppFS
-image `releases/TanRadio.bin` and its SHA-256 sidecar. `make package` writes the
-distribution archives, README and checksums under `dist/`.
+`sdkconfig_tanmatsu` holds the production configuration and `sdkconfigs/`
+supplies reproducible defaults. `make build` writes to `build/tanmatsu` and
+ESP-IDF caches downloaded dependencies in `managed_components/`. The release
+bundle includes the AppFS application at `releases/TanRadio.bin` and its SHA-256
+sidecar. `make package` writes distribution archives, a README, and checksums
+under `dist/TanRadio-<version>-r<revision>/`.
 The sharing export includes source, local components, tests, configuration,
 assets, documentation and the current application image, without Git history
 or historical test payloads. `metadata.json` supplies the version/revision for

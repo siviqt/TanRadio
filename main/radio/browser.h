@@ -5,10 +5,13 @@
 #include "radio/stations.h"
 
 #define BROWSER_QUERY_LENGTH 96
-#define BROWSER_RESULT_LIMIT 20
+#define BROWSER_PAGE_SIZE 20
 
 typedef struct {
     bool busy;
+    bool can_retry;
+    bool at_start;
+    bool at_end;
     size_t count;
     unsigned revision;
     char message[96];
@@ -25,6 +28,11 @@ bool radio_browser_search_by(const char *query, radio_browser_search_mode_t mode
 void radio_browser_cancel(void);
 void radio_browser_status(radio_browser_status_t *status);
 bool radio_browser_result(size_t index, radio_station_t *station);
+bool radio_browser_selected(radio_station_t *station);
+void radio_browser_move(int direction);
+bool radio_browser_retry(void);
+size_t radio_browser_window(radio_browser_status_t *status, radio_station_t *rows,
+                            size_t capacity, size_t *selected_row);
 /* Best effort; never waits for a directory request on the playback caller. */
 void radio_browser_count_play(const char *stationuuid);
 

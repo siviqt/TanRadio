@@ -23,8 +23,8 @@ static const char *TAG = "tanradio.stations";
 #define STATIONS_MAX_BITRATE_KBPS 10000
 
 static radio_station_t *catalog = NULL;
-/* Allocated once before playback; runtime additions never move the array. Removal compacts it under the UI
- * mutex; readers must not retain catalog pointers across removals.
+/* Allocated once before playback; runtime additions never move the array.
+ * The catalog writer compacts it while UI and playback readers are excluded.
  * Publishing count last makes appended records visible to readers. */
 static atomic_size_t catalog_count = 0;
 
@@ -450,7 +450,7 @@ esp_err_t stations_save(const char *path, const radio_station_t *station,
     return ESP_OK;
 }
 
-esp_err_t stations_remove(const char *path, size_t index)
+esp_err_t stations_remove_file(const char *path, size_t index)
 {
     size_t count = catalog_count;
     if (!path || index >= count) return ESP_ERR_INVALID_ARG;
@@ -544,9 +544,13 @@ esp_err_t stations_remove(const char *path, size_t index)
     if (fflush(target) != 0 || fsync(fileno(target)) != 0) ok = false;
     if (fclose(target) != 0) ok = false;
     if (!ok) { remove(temporary); return ESP_FAIL; }
-    esp_err_t result = stations_replace_file(path, temporary, backup);
-    if (result != ESP_OK) return result;
+    return stations_replace_file(path, temporary, backup);
+}
+
+void stations_publish_removal(size_t index)
+{
+    size_t count = catalog_count;
+    if (index >= count) return;
     memmove(&catalog[index], &catalog[index + 1], (count - index - 1) * sizeof(*catalog));
     catalog_count = count - 1;
-    return ESP_OK;
 }

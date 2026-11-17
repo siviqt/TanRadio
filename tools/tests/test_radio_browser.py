@@ -74,13 +74,20 @@ static void check_unchanged(const char *before) {
 }
 static void put16(unsigned char *p, unsigned n) { p[0] = n >> 8; p[1] = n; }
 
+static esp_err_t remove_station(const char *path, size_t index) {
+    esp_err_t result = stations_remove_file(path, index);
+    if (result == ESP_OK) stations_publish_removal(index);
+    return result;
+}
+
 int main(void) {
-    radio_station_t records[20]; size_t count;
+    radio_station_t records[20]; size_t count, raw_count;
     char *data = read_file("mixed.json");
-    assert(browser_parse_stations(data, records, 20, &count) && count == 2);
+    assert(browser_parse_stations(data, records, 20, &count, &raw_count) && count == 4 && raw_count > count);
     assert(!strcmp(records[0].name, "Good Station"));
     assert(!strcmp(records[0].url, "https://example.org/live.mp3?x=1&y=2"));
     assert(records[0].bitrate_kbps == 128 && !strcmp(records[1].country, ""));
+    assert(!strcmp(records[2].codec, "AAC+") && !strcmp(records[3].codec, "AAC"));
     free(data);
     char logo[64];
     const char *uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -94,12 +101,12 @@ int main(void) {
     assert(!browser_parse_logo(logos, "cccccccc-cccc-cccc-cccc-cccccccccccc", logo, sizeof(logo)));
     assert(!browser_parse_logo("[{\"stationuuid\":\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\","
         "\"favicon\":\"http://example.org/insecure.png\"}]", uuid, logo, sizeof(logo)));
-    assert(!browser_parse_stations("[{}", records, 20, &count));
-    assert(!browser_parse_stations("{}", records, 20, &count));
-    assert(!browser_parse_stations("[]garbage", records, 20, &count));
-    assert(browser_parse_stations("[]", records, 20, &count) && count == 0);
+    assert(!browser_parse_stations("[{}", records, 20, &count, NULL));
+    assert(!browser_parse_stations("{}", records, 20, &count, NULL));
+    assert(!browser_parse_stations("[]garbage", records, 20, &count, NULL));
+    assert(browser_parse_stations("[]", records, 20, &count, NULL) && count == 0);
     char deep[80]; memset(deep, '[', 32); memset(deep + 32, ']', 32); deep[64] = 0;
-    assert(!browser_parse_stations(deep, records, 20, &count));
+    assert(!browser_parse_stations(deep, records, 20, &count, NULL));
     char encoded[64];
     assert(browser_encode_query("A&B + Радио", encoded, sizeof(encoded)));
     assert(!strcmp(encoded, "A%26B%20%2B%20%D0%A0%D0%B0%D0%B4%D0%B8%D0%BE"));
@@ -142,7 +149,7 @@ int main(void) {
     assert(stations_load_file("fresh/stations.txt") == ESP_ERR_NOT_FOUND);
     assert(stations_count() == 0);
     data = read_file("mixed.json");
-    assert(browser_parse_stations(data, records, 20, &count)); free(data);
+    assert(browser_parse_stations(data, records, 20, &count, NULL)); free(data);
     size_t first_index; bool first_duplicate;
     assert(stations_save("fresh/stations.txt", &records[0], &first_index,
                          &first_duplicate) == ESP_OK);
@@ -158,7 +165,7 @@ int main(void) {
     assert(stations_load_file("stations.txt") == ESP_OK && stations_count() == 1);
     const radio_station_t *stable = stations_get(0);
     data = read_file("mixed.json");
-    assert(browser_parse_stations(data, records, 20, &count)); free(data);
+    assert(browser_parse_stations(data, records, 20, &count, NULL)); free(data);
     radio_station_t station = records[0];
     size_t index; bool duplicate;
     renames = 0; fail_rename = 2;
@@ -214,38 +221,40 @@ int main(void) {
     write_file("stations.txt", removal);
     assert(stations_load_file("stations.txt") == ESP_OK && stations_count() == 2);
     radio_station_t owned = *stations_get(0);
-    assert(stations_remove("stations.txt", 2) == ESP_ERR_INVALID_ARG);
+    assert(remove_station("stations.txt", 2) == ESP_ERR_INVALID_ARG);
     for (unsigned failure = 0; failure < 3; failure++) {
         renames = 0; fail_rename = failure < 2 ? failure + 1 : 0;
         fail_sync = failure == 2;
-        assert(stations_remove("stations.txt", 0) != ESP_OK);
+        assert(remove_station("stations.txt", 0) != ESP_OK);
         check_unchanged(removal);
         assert(stations_count() == 2 && stations_same(stations_get(0), &owned));
     }
     fail_sync = fail_rename = 0;
-    assert(stations_remove("stations.txt", 0) == ESP_OK);
+    assert(stations_remove_file("stations.txt", 0) == ESP_OK);
     check_unchanged(kept);
+    assert(stations_count() == 2 && stations_same(stations_get(0), &owned));
+    stations_publish_removal(0);
     assert(stations_count() == 1 && !strcmp(stations_get(0)->name, "Keep me"));
     assert(!strcmp(owned.name, "Remove me") && !strcmp(owned.url, "http://example.org/remove"));
     assert(stations_load_file("stations.txt") == ESP_OK && stations_count() == 1);
     assert(!stations_get(0)->stationuuid[0]); /* Removed metadata cannot leak. */
-    assert(stations_remove("stations.txt", 0) == ESP_OK && stations_count() == 0);
+    assert(remove_station("stations.txt", 0) == ESP_OK && stations_count() == 0);
     check_unchanged("# header\r\n# user note\r\n\n# next note\nmalformed user line\n");
     assert(stations_load_file("stations.txt") == ESP_ERR_NOT_FOUND);
     for (unsigned cycle = 0; cycle < 150; cycle++) {
         assert(stations_save("stations.txt", &owned, &index, &duplicate) == ESP_OK);
         assert(index == 0 && !duplicate && stations_count() == 1);
-        assert(stations_remove("stations.txt", 0) == ESP_OK && stations_count() == 0);
+        assert(remove_station("stations.txt", 0) == ESP_OK && stations_count() == 0);
     }
     /* Identical legacy rows are separate entries; only the selected one goes. */
     write_file("stations.txt", "Same:::http://example.org/same:::BG:::MP3\n"
                "# keep this comment\nSame:::http://example.org/same:::BG:::MP3\n");
     assert(stations_load_file("stations.txt") == ESP_OK && stations_count() == 2);
-    assert(stations_remove("stations.txt", 1) == ESP_OK && stations_count() == 1);
+    assert(remove_station("stations.txt", 1) == ESP_OK && stations_count() == 1);
     check_unchanged("Same:::http://example.org/same:::BG:::MP3\n# keep this comment\n");
     /* Refuse external catalog edits rather than deleting a different station. */
     write_file("stations.txt", "Other:::http://example.org/other:::BG:::MP3\n");
-    assert(stations_remove("stations.txt", 0) != ESP_OK && stations_count() == 1);
+    assert(remove_station("stations.txt", 0) != ESP_OK && stations_count() == 1);
     assert(!strcmp(stations_get(0)->name, "Same"));
     check_unchanged("Other:::http://example.org/other:::BG:::MP3\n");
     /* Overlong user lines are preserved and do not bind metadata to a row. */
@@ -253,7 +262,7 @@ int main(void) {
     for (unsigned i = 0; i < 3000; i++) fputc('x', f);
     fputs("\nRemove:::http://example.org/remove:::BG:::MP3\n", f); fclose(f);
     assert(stations_load_file("stations.txt") == ESP_OK && stations_count() == 1);
-    assert(stations_remove("stations.txt", 0) == ESP_OK);
+    assert(remove_station("stations.txt", 0) == ESP_OK);
     data = read_file("stations.txt"); assert(strlen(data) == 3001 && data[3000] == '\n'); free(data);
     puts("PASS: bounded parsing, catalog compatibility, duplicate saves, empty catalogs, limits, recovery, removal preservation and rollback");
 }
@@ -277,6 +286,7 @@ RUNTIME_STUBS = r'''
 void vTaskDelay(unsigned);
 typedef void *QueueHandle_t;
 typedef void *SemaphoreHandle_t;
+typedef int BaseType_t;
 QueueHandle_t xQueueCreate(unsigned, unsigned);
 int xQueueSendToFront(QueueHandle_t, const void *, unsigned);
 int xQueueSendToBack(QueueHandle_t, const void *, unsigned);
@@ -368,12 +378,26 @@ static const char *payload = "[{\"name\":\"Test Station\",\"url_resolved\":\"htt
     "\"codec\":\"MP3\",\"countrycode\":\"BG\",\"hls\":0,\"lastcheckok\":1,"
     "\"stationuuid\":\"01234567-89ab-cdef-0123-456789abcdef\",\"bitrate\":128}]";
 bool network_is_connected(void) { return connected; }
-struct fake_http { size_t position; char url[640]; };
+struct fake_http { size_t position; char url[640]; char *page; };
+static const char *response(esp_http_client_handle_t handle) {
+    return handle->page ? handle->page : payload;
+}
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *c) {
     assert(c->crt_bundle_attach && c->disable_auto_redirect && c->timeout_ms == 5000);
     assert(!strncmp(c->url, "https://", 8) && strstr(c->user_agent, "TanRadio/"));
     struct fake_http *h = calloc(1, sizeof(*h)); assert(h);
     snprintf(h->url, sizeof(h->url), "%s", c->url);
+    if (strstr(h->url, "?name=wide&")) {
+        char *offset = strstr(h->url, "&offset=");
+        size_t row;
+        assert(offset && sscanf(offset, "&offset=%zu", &row) == 1 && row % 20 == 0);
+        char name[32];
+        snprintf(name, sizeof(name), "page-%zu.json", row);
+        FILE *file = fopen(name, "rb"); assert(file);
+        h->page = calloc(16384, 1); assert(h->page);
+        assert(fread(h->page, 1, 16383, file) > 0 && feof(file));
+        fclose(file);
+    }
     snprintf(last_url, sizeof(last_url), "%s", c->url); return h;
 }
 int esp_http_client_open(esp_http_client_handle_t h, int length) {
@@ -384,23 +408,30 @@ int esp_http_client_open(esp_http_client_handle_t h, int length) {
 int esp_http_client_get_and_clear_last_tls_error(esp_http_client_handle_t h, int *error, int *flags) {
     (void)h; *error = -0x50; *flags = 0; return ESP_OK;
 }
-int64_t esp_http_client_fetch_headers(esp_http_client_handle_t h) { (void)h; return oversized ? SEARCH_BODY_LIMIT + 10 : strlen(payload); }
+int64_t esp_http_client_fetch_headers(esp_http_client_handle_t h) { return oversized ? SEARCH_BODY_LIMIT + 10 : strlen(response(h)); }
 int esp_http_client_get_status_code(esp_http_client_handle_t h) { (void)h; return 200; }
 int esp_http_client_read(esp_http_client_handle_t h, char *buffer, int capacity) {
     if (cancel_read) { cancel_read = false; radio_browser_cancel(); }
-    size_t size = strlen(payload) - h->position;
+    const char *body = response(h);
+    size_t size = strlen(body) - h->position;
     if (truncated && h->position) return 0;
     if (size > 31) size = 31;
     assert((int)size <= capacity);
-    memcpy(buffer, payload + h->position, size); h->position += size; return size;
+    memcpy(buffer, body + h->position, size); h->position += size; return size;
 }
-bool esp_http_client_is_complete_data_received(esp_http_client_handle_t h) { return h->position == strlen(payload); }
+bool esp_http_client_is_complete_data_received(esp_http_client_handle_t h) { return h->position == strlen(response(h)); }
 void esp_http_client_close(esp_http_client_handle_t h) { (void)h; }
-void esp_http_client_cleanup(esp_http_client_handle_t h) { free(h); }
+void esp_http_client_cleanup(esp_http_client_handle_t h) { free(h->page); free(h); }
 static void cache_mirrors(void) {
     mirror_count = 2; mirrors_expire = INT64_MAX;
     strcpy(mirrors[0], "first.api.radio-browser.info");
     strcpy(mirrors[1], "second.api.radio-browser.info");
+}
+static unsigned selected_id(void) {
+    radio_station_t station;
+    unsigned id;
+    assert(radio_browser_selected(&station) && sscanf(station.name, "Station %u", &id) == 1);
+    return id;
 }
 int main(void) {
     radio_browser_init(); assert(jobs && mutex && results); cache_mirrors();
@@ -409,6 +440,7 @@ int main(void) {
     browser_worker(NULL);
     radio_browser_status_t state; radio_browser_status(&state);
     assert(!state.busy && state.count == 1 && requests == 1);
+    assert(state.at_start && state.at_end);
     assert(strstr(last_url, "name=A%26B%20%2B%20%D0%A0"));
     radio_station_t snapshot;
     assert(radio_browser_result(0, &snapshot));
@@ -416,11 +448,11 @@ int main(void) {
     assert(!radio_browser_search_by("BG", (radio_browser_search_mode_t)99));
     assert(radio_browser_search_by("  bg  ", BROWSER_SEARCH_COUNTRY));
     browser_worker(NULL);
-    assert(strstr(last_url, "countrycode=BG&codec=MP3"));
+    assert(strstr(last_url, "countrycode=BG&hidebroken=true&limit=20&offset=0&order=name"));
     assert(!strstr(last_url, "?name="));
     assert(radio_browser_search_by("United Kingdom", BROWSER_SEARCH_COUNTRY));
     browser_worker(NULL);
-    assert(strstr(last_url, "country=United%20Kingdom&codec=MP3"));
+    assert(strstr(last_url, "country=United%20Kingdom&hidebroken=true"));
     assert(radio_browser_search_by("A&B", BROWSER_SEARCH_COUNTRY));
     assert(radio_browser_search("name takes priority"));
     browser_worker(NULL);
@@ -428,6 +460,7 @@ int main(void) {
     assert(radio_browser_search_by("BG", BROWSER_SEARCH_COUNTRY));
     radio_browser_cancel(); browser_worker(NULL);
     radio_browser_status(&state); assert(!state.busy && state.count == 0);
+    assert(!state.at_start && !state.at_end);
     cancel_read = true;
     assert(radio_browser_search("cancel during HTTP read")); browser_worker(NULL);
     radio_browser_status(&state); assert(!state.busy && state.count == 0);
@@ -475,6 +508,51 @@ int main(void) {
     radio_browser_count_play(snapshot.stationuuid); browser_worker(NULL);
     assert(requests == 1 && retry_delays == 0);
     puts("PASS: search supersession, cancellation during HTTP read, mirror failover, response bounds, offline errors and queued playback clicks");
+
+    fail_all = false; cache_mirrors();
+    assert(radio_browser_search("wide")); browser_worker(NULL);
+    assert(selected_id() == 0);
+    radio_browser_status(&state);
+    assert(state.at_start && !state.at_end);
+    for (unsigned i = 0; i < 19; i++) radio_browser_move(1);
+    radio_browser_status(&state);
+    assert(state.busy && state.count == 20 && selected_id() == 19 && queue.count == 1);
+    assert(!state.at_start && !state.at_end);
+    radio_browser_move(1); radio_browser_move(1);
+    unsigned before = requests;
+    browser_worker(NULL);
+    assert(requests == before + 2 && selected_id() == 41); /* Filtered page, then duplicate URL. */
+    for (unsigned i = 41; i < 57; i++) radio_browser_move(1);
+    assert(selected_id() == 57);
+    fail_all = true; browser_worker(NULL);
+    radio_browser_status(&state);
+    assert(!state.busy && state.can_retry && state.count == 39 && selected_id() == 57);
+    assert(!state.at_start && !state.at_end);
+    assert(radio_browser_retry()); fail_all = false; browser_worker(NULL);
+    assert(selected_id() == 57 && strstr(last_url, "&offset=60"));
+    for (unsigned i = 57; i < 114; i++) {
+        radio_browser_move(1); browser_worker(NULL);
+        assert(selected_id() == i + 1);
+    }
+    radio_browser_status(&state);
+    assert(selected_id() == 114 && state.count <= 60 && !state.at_start && state.at_end);
+    radio_station_t view[5];
+    size_t row;
+    assert(radio_browser_window(&state, view, 5, &row) == 5 && row == 4);
+    assert(!state.at_start && state.at_end && !strcmp(view[row].name, "Station 114"));
+    for (size_t i = 1; i < state.count; i++) radio_browser_move(-1);
+    assert(radio_browser_window(&state, view, 5, &row) == 5 && row == 0);
+    assert(state.busy && !state.at_start && !state.at_end);
+    before = requests;
+    for (unsigned i = 0; i < 120 && selected_id(); i++) {
+        unsigned previous = selected_id();
+        radio_browser_move(-1); browser_worker(NULL);
+        assert(selected_id() < previous);
+    }
+    assert(selected_id() == 0 && requests > before);
+    radio_browser_status(&state);
+    assert(state.at_start && !state.at_end);
+    puts("PASS: 115 raw rows, zero-match page, overlap, retry, eviction, backwards refetch and confirmed boundaries");
     free(results);
 }
 '''
@@ -488,7 +566,7 @@ def main():
                 codec="MP3", stationuuid="01234567-89ab-cdef-0123-456789abcdef",
                 hls=0, lastcheckok=1, bitrate=128)
     fixtures = [base, base.copy()]
-    for changes in [dict(hls=1), dict(codec="AAC"), dict(lastcheckok=0),
+    for changes in [dict(hls=1, codec="FLAC"), dict(codec="UNKNOWN"), dict(lastcheckok=0),
                     dict(stationuuid="invalid"), dict(url_resolved="ftp://example.org/x"),
                     dict(name="x" * 97), dict(name="Injected\nrecord"),
                     dict(name="Bad:::delimiter"), dict(url_resolved="https://example.org/" + "x" * 512),
@@ -497,17 +575,32 @@ def main():
     fixtures.append(dict(base, name="Unknown country", countrycode="", bitrate=None,
                          stationuuid="11234567-89ab-cdef-0123-456789abcdef",
                          url_resolved="http://example.org/second"))
+    fixtures.append(dict(base, name="AAC Plus", codec="AAC+",
+                         stationuuid="21234567-89ab-cdef-0123-456789abcdef",
+                         url_resolved="http://example.org/aac"))
+    fixtures.append(dict(base, name="HLS AAC", codec="AAC", hls=1,
+                         stationuuid="31234567-89ab-cdef-0123-456789abcdef",
+                         url_resolved="https://example.org/index.m3u8"))
     with tempfile.TemporaryDirectory(prefix="tanradio-browser-") as directory:
         work = Path(directory)
         for name in ["esp_err.h", "esp_log.h", "esp_heap_caps.h"]:
             (work / name).write_text(STUBS)
         (work / "harness.c").write_text(HARNESS)
         (work / "mixed.json").write_text(json.dumps(fixtures))
+        for offset in range(0, 115, 20):
+            page = []
+            for i in range(offset, min(offset + 20, 115)):
+                page.append(dict(base, name=f"Station {i}",
+                                 stationuuid=f"{i:08x}-89ab-cdef-0123-456789abcdef",
+                                 url_resolved=f"https://example.org/live/{19 if i == 40 else i}",
+                                 codec="UNKNOWN" if offset == 20 else "MP3"))
+            (work / f"page-{offset}.json").write_text(json.dumps(page))
         command = ["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                    "-Wno-sign-compare", "-g", "-fsanitize=address,undefined",
                    "-DCJSON_NESTING_LIMIT=16", "-I", str(work), "-I", str(ROOT / "main"),
                    "-I", str(CJSON), str(work / "harness.c"),
                    str(ROOT / "main/radio/stations.c"), str(ROOT / "main/radio/browser_parse.c"),
+                   str(ROOT / "main/radio/stream_format.c"),
                    str(CJSON / "cJSON.c"), "-Wl,--wrap=rename", "-Wl,--wrap=fsync",
                    "-o", str(work / "check")]
         subprocess.run(command, check=True)
