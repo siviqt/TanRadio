@@ -30,6 +30,7 @@ idf_component_register(
         "ui/controls.c"
         "ui/exit.c"
         "ui/settings.c"
+        "ui/shortcuts.c"
         "ui/theme.c"
         "ui/about.c"
         "ui/about_view.c"
@@ -82,5 +83,5 @@ idf_build_set_property(COMPILE_OPTIONS "-Wno-error=unused-variable" APPEND)
 idf_build_set_property(COMPILE_OPTIONS "-Wno-error=unused-const-variable" APPEND)
 
 # Keep compiler stack accounting for the search-render regression check.
-set_source_files_properties("ui/ui.c" "ui/about_view.c" "ui/settings.c" "radio/stations.c"
+set_source_files_properties("ui/ui.c" "ui/about_view.c" "ui/settings.c" "ui/shortcuts.c" "radio/stations.c"
     PROPERTIES COMPILE_OPTIONS "-fstack-usage")

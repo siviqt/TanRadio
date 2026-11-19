@@ -1,6 +1,7 @@
 #include "welcome.h"
 #include "pax_fonts.h"
 #include "pax_text.h"
+#include "ui/shortcuts.h"
 #include "theme.h"
 
 static void session_draw(pax_buf_t *buffer, const pax_buf_t *logo)
@@ -28,20 +29,24 @@ void welcome_draw(pax_buf_t *buffer, const pax_buf_t *logo)
         "before starting. TanRadio connects using\n"
         "your saved networks.");
 
+    ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_F2), "Find and add radio stations",
+                     274, 249, UI_COLOR_SECONDARY, UI_TEXT_BODY);
+    ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_F4), "Play, mute or unmute your selection",
+                     274, 280, UI_COLOR_SECONDARY, UI_TEXT_BODY);
     pax_draw_text(buffer, UI_COLOR_SECONDARY, UI_FONT_BODY,
-        UI_TEXT_BODY, 280, 244,
-        "Press F2 to find and add radio stations.\n"
-        "F4 plays, mutes or unmutes your selection.\n"
+        UI_TEXT_BODY, 280, 302,
         "You can also edit /tanradio/stations.txt\n"
         "on the SD card while TanRadio is closed.\n"
         "An SD card is required.");
 
     pax_draw_round_rect(buffer, UI_COLOR_ACCENT, 280, 391, 492, 53, 10);
     pax_draw_round_rect(buffer, UI_COLOR_SELECTION, 282, 393, 488, 49, 8);
-    pax_draw_text(buffer, UI_COLOR_TEXT, UI_FONT_BODY,
-        26, 393, 400, "Press SPACE to start");
-    pax_draw_text(buffer, UI_COLOR_SECONDARY, UI_FONT_BODY,
-        UI_TEXT_SMALL, 280, 451, "F1 Options/Exit     Hyper About");
+    ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_SPACE), "Start TanRadio",
+                     398, 417, UI_COLOR_TEXT, 26);
+    float next_x = ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_F1), "Options/Exit",
+                                    274, 461, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
+    ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_HYPER), "About",
+                     next_x + 22, 461, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
 }
 
 void welcome_draw_exit(pax_buf_t *buffer, const pax_buf_t *logo)

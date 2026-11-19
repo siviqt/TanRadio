@@ -213,23 +213,24 @@ done:
     return ok && !cancelled(request);
 }
 
-static void search_message_locked(const char *message)
+static void search_message_locked(const char *message, radio_browser_hint_t hint)
 {
     status.revision++;
+    status.hint = hint;
     snprintf(status.message, sizeof(status.message), "%s", message);
 }
 
-static void search_failure_locked(const char *message)
+static void search_failure_locked(const char *message, radio_browser_hint_t hint)
 {
     status.busy = false;
     status.can_retry = true;
-    search_message_locked(message);
+    search_message_locked(message, hint);
 }
 
-static void fail_page(unsigned request, const char *message)
+static void fail_page(unsigned request, const char *message, radio_browser_hint_t hint)
 {
     xSemaphoreTake(mutex, portMAX_DELAY);
-    if (request == generation) search_failure_locked(message);
+    if (request == generation) search_failure_locked(message, hint);
     xSemaphoreGive(mutex);
 }
 
@@ -238,7 +239,7 @@ static void request_new_mirror(unsigned request)
     xSemaphoreTake(mutex, portMAX_DELAY);
     if (request == generation) {
         status.busy = status.can_retry = false;
-        search_message_locked("Directory mirror unavailable. Press Enter to start a new search.");
+        search_message_locked("Directory mirror unavailable.", BROWSER_HINT_SEARCH_AGAIN);
     }
     xSemaphoreGive(mutex);
 }
@@ -256,16 +257,17 @@ static bool queue_page_locked(browser_job_t job, bool priority)
     status.busy = true;
     status.can_retry = false;
     search_message_locked(!status.count ? "Searching Radio Browser..." :
-                          job.direction < 0 ? "Loading earlier stations..." : "Loading more stations...");
+                          job.direction < 0 ? "Loading earlier stations..." : "Loading more stations...",
+                          BROWSER_HINT_NONE);
     BaseType_t queued = priority ? xQueueSendToFront(jobs, &job, 0) : xQueueSendToBack(jobs, &job, 0);
     if (queued == pdTRUE) return true;
-    search_failure_locked("Directory is busy. Press Enter to retry.");
+    search_failure_locked("Directory is busy.", BROWSER_HINT_RETRY);
     return false;
 }
 
 static void ready_message_locked(void)
 {
-    search_message_locked(status.count ? "" : "No compatible stations found.");
+    search_message_locked(status.count ? "" : "No compatible stations found.", BROWSER_HINT_NONE);
 }
 
 static bool can_cache_page_locked(int direction)
@@ -375,7 +377,7 @@ static void browser_worker(void *arg)
     while (xQueueReceive(jobs, &job, portMAX_DELAY) == pdTRUE) {
         if (cancelled(job.generation)) continue;
         if (!network_is_connected()) {
-            if (job.generation) fail_page(job.generation, "Connect to Wi-Fi, then press Enter to retry.");
+            if (job.generation) fail_page(job.generation, "Connect to Wi-Fi.", BROWSER_HINT_RETRY);
             continue;
         }
         bool pinned = job.generation && job.generation == mirror_generation;
@@ -384,14 +386,14 @@ static void browser_worker(void *arg)
             mirrors_expire = esp_timer_get_time() + 30LL * 60 * 1000000;
         }
         if (!pinned && !mirror_count) {
-            if (job.generation) fail_page(job.generation, "Directory discovery failed. Press Enter to retry.");
+            if (job.generation) fail_page(job.generation, "Directory discovery failed.", BROWSER_HINT_RETRY);
             continue;
         }
         char encoded[BROWSER_QUERY_LENGTH * 3 + 1];
         char path[480];
         if (job.generation) {
             if (!browser_encode_query(job.query, encoded, sizeof(encoded))) {
-                fail_page(job.generation, "Search term is too long.");
+                fail_page(job.generation, "Search term is too long.", BROWSER_HINT_NONE);
                 continue;
             }
             const char *field = "name";
@@ -453,11 +455,15 @@ static void browser_worker(void *arg)
         } else if (pinned && job.retry && failure == BROWSER_FAILURE_CONNECT) {
             request_new_mirror(job.generation);
         } else if (job.generation) {
-            const char *message = !body || !found ? "Not enough memory. Try again after stopping playback." :
-                failure == BROWSER_FAILURE_CONNECT ? "Directory connection failed. Press Enter to retry." :
-                failure == BROWSER_FAILURE_SIZE ? "Directory response too large. Refine the search." :
-                "Directory response failed. Press Enter to retry.";
-            fail_page(job.generation, message);
+            if (!body || !found) {
+                fail_page(job.generation, "Not enough memory. Try again after stopping playback.", BROWSER_HINT_NONE);
+            } else if (failure == BROWSER_FAILURE_SIZE) {
+                fail_page(job.generation, "Directory response too large. Refine the search.", BROWSER_HINT_NONE);
+            } else {
+                const char *message = failure == BROWSER_FAILURE_CONNECT ? "Directory connection failed." :
+                    "Directory response failed.";
+                fail_page(job.generation, message, BROWSER_HINT_RETRY);
+            }
         }
         if (!success && !cancelled(job.generation)) mirror_count = 0;
         free(found);
@@ -523,7 +529,7 @@ void radio_browser_cancel(void)
     xSemaphoreTake(mutex, portMAX_DELAY);
     next_generation();
     clear_pages_locked();
-    search_message_locked("Type a name or country; Tab changes mode.");
+    search_message_locked("Type a name or country.", BROWSER_HINT_NONE);
     xSemaphoreGive(mutex);
 }
 

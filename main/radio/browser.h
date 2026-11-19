@@ -7,6 +7,12 @@
 #define BROWSER_QUERY_LENGTH 96
 #define BROWSER_PAGE_SIZE 20
 
+typedef enum {
+    BROWSER_HINT_NONE,
+    BROWSER_HINT_RETRY,
+    BROWSER_HINT_SEARCH_AGAIN,
+} radio_browser_hint_t;
+
 typedef struct {
     bool busy;
     bool can_retry;
@@ -14,6 +20,7 @@ typedef struct {
     bool at_end;
     size_t count;
     unsigned revision;
+    radio_browser_hint_t hint;
     char message[96];
 } radio_browser_status_t;
 

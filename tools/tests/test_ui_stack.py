@@ -39,7 +39,15 @@ def main():
     settings_object = build / "esp-idf/main/CMakeFiles/__idf_main.dir/ui/settings.c.su"
     settings_stack = next(int(line.split("\t")[1]) for line in settings_object.read_text().splitlines()
                           if ":ui_settings_draw\t" in line)
-    rendering = frames["ui_render"] + max(
+    # Include the shared shortcut drawing frames, including any out-of-line helpers.
+    shortcut_stack = 0
+    for line in stack_path.with_name("shortcuts.c.su").read_text().splitlines():
+        location, size, kind = line.split("\t")
+        name = location.rsplit(":", 1)[1]
+        if name == "ui_draw_shortcut" or name.startswith("draw_"):
+            assert kind == "static", f"Unbounded shortcut drawing frame: {name} ({kind})"
+            shortcut_stack += int(size)
+    rendering = frames["ui_render"] + shortcut_stack + max(
         frames["ui_draw_search"] + frames["ui_draw_button_legend"],
         frames["ui_draw_remove_dialog"] + frames["ui_draw_button_legend"],
         frames["ui_draw_session_screen"], frames["ui_draw_exit_confirmation"],

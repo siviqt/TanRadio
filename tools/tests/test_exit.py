@@ -209,11 +209,13 @@ int main(void) {
     fail_settings_save = true;
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F4);
     assert(!ui_settings_revision && ui_preferences.contrast == 60 && !led_updates && !vivid_theme);
+    assert(ui_settings.retry && strstr(ui_settings.notice, "Could not save settings"));
     fail_settings_save = false;
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F4);
     assert(ui_settings_revision == 1 && ui_preferences.contrast == 61);
     assert(ui_preferences.theme == UI_THEME_VIVID && vivid_theme);
     assert(ui_preferences.led_brightness == 55 && led_brightness == 55 && led_updates == 1);
+    assert(!ui_settings.retry);
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_RIGHT);
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F1);
     assert(ui_exit_state == UI_EXIT_SETTINGS && !exits);
@@ -319,7 +321,7 @@ int main(void) {
     fail_led_update = true;
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F4);
     assert(ui_preferences.led_brightness == 0 && led_brightness == 50 && led_updates == 1);
-    assert(strstr(ui_settings.notice, "LED update failed"));
+    assert(ui_settings.retry && strstr(ui_settings.notice, "LED update failed"));
     fail_led_update = false;
     input_dispatch_navigation(BSP_INPUT_NAVIGATION_KEY_F4);
     assert(led_brightness == 0 && led_updates == 2);

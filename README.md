@@ -1,7 +1,7 @@
 # TanRadio
 
 TanRadio is an Internet radio application for the Tanmatsu platform.
-This source builds **0.9.0, AppFS revision 17**, using BSP/LCD 2.0.0 for both
+This source builds **0.9.1, AppFS revision 18**, using BSP/LCD 2.0.0 for both
 Tanmatsu display variants.
 
 On every launch, an 800 × 480 welcome screen explains Wi-Fi setup and the
@@ -16,23 +16,23 @@ The radio is reset on entry to discard any previous launcher's SDIO state;
 this initialization runs in the background.
 
 The Midnight theme uses a navy background, slate panels, cyan selection outlines,
-Saira Condensed headings and Saira Regular body text. Status and help labels are
-at least 18 pixels, with larger station names and search results.
+Saira Condensed headings and Saira Regular body text. Shortcut hints use Tanmatsu's
+function-key symbols, directional arrows, and the Backspace symbol.
 
-Press **F1 Options/Exit** to open TanRadio Options. Press **F1 again** to return
-to the launcher, **F2** or **Esc** to restore the previous screen, or **F3** to
-open Settings. Exit requires two distinct F1 presses. Options opens from the
-welcome screen, startup, player, search and removal dialog. It wakes the
+Press the **red cross (F1)** to open TanRadio Options. Press it again to return
+to the launcher, the **orange triangle (F2)** to cancel, or the **yellow square (F3)**
+to open Settings. Esc also cancels. Exit requires two distinct F1 presses.
+Options opens from the welcome screen, startup, player, search and removal dialog. It wakes the
 screen when needed and keeps volume keys available. The second F1 press
 silences audio. The goodbye splash appears before the app closes the
 external display and returns to the launcher.
 
 ## Settings and external display
 
-Use **Up/Down** to select a setting and **Left/Right** to edit. **F4 Apply**
-saves preferences on the device. **F2** or **Esc** discards unapplied edits
-and returns to Options. From the welcome screen, external display preferences
-take effect when you press **Space** to start TanRadio.
+The **↑ ↓ Select** and **← → Edit** hints show which arrows to use. Press the
+**green circle (F4)** to apply settings. The **orange triangle (F2)** is **Back**.
+F2 or Esc discards unapplied edits and returns to Options. From the welcome
+screen, external display preferences take effect when you press **Space** to start TanRadio.
 
 - **External display** starts Off. Select **Nokia 5110** to show the current
   station, track title, playback state and a monochrome logo on a PCD8544 LCD.
@@ -57,8 +57,8 @@ The Nokia driver uses the following Tanmatsu CATT wiring. Leave the LCD's
 | ESP32-P4 | GPIO 5 | GPIO 15 | GPIO 4 | GPIO 3 | GPIO 2 | 3.3 V | Ground |
 
 Settings reports **Nokia initialized · connection unverified** because the
-LCD interface is write-only. If an operation fails, check the wiring and
-use **F4 Apply** to retry.
+LCD interface is write-only. If an operation fails, check the wiring and press
+the **green circle (F4)** when Settings shows **Retry**.
 
 ## Now Playing
 
@@ -103,17 +103,17 @@ and opening the dialog does not stop, mute, or replace the current station.
 
 | Key | Station list | Station search |
 | --- | --- | --- |
-| F1 | Options / Exit | Options / Exit |
-| F2 | Find stations | Back to station list |
-| F3 | Stop | Stop |
-| F4 | Play / Mute / Unmute | Play / Mute / Unmute |
-| F5 | Play next saved station | Save selected result |
-| F6 / power button | Toggle illumination | Toggle illumination |
+| F1 · red cross | Options / Exit | Options / Exit |
+| F2 · orange triangle | Find stations | Back to station list |
+| F3 · yellow square | Stop | Stop |
+| F4 · green circle | Play / Mute / Unmute | Play / Mute / Unmute |
+| F5 · cyan three-lobed symbol | Play next saved station | Save selected result |
+| F6 · purple diamond / power button | Toggle illumination | Toggle illumination |
 | Hyper (between left Ctrl and Alt) | About TanRadio | About TanRadio |
 | Up / Down | Move highlight | Move highlight |
 | Enter | Play highlighted station | Submit the search or retry a failed page |
 | Esc | Highlight current station | Back to station list |
-| Backspace | Remove highlighted saved station (confirmation) | Delete previous character |
+| Backspace · ⌫ | Open removal confirmation for highlighted saved station | Delete previous character |
 
 F4 shows **Play** when stopped or when another station is highlighted. For
 the active station it shows **Mute** or **Unmute**, including while buffering;
@@ -122,8 +122,8 @@ so saving a preview or finding it again preserves its active playback state.
 An unsaved preview remains selected as a temporary **Preview** row when you
 leave search. It disappears when you play another station or save the preview.
 
-On the station list, Backspace opens a removal confirmation naming the
-highlighted saved station. F4 removes it; F2 cancels. Enter does not confirm.
+On the station list, **⌫ Remove** prompts you to press Backspace to open a
+confirmation for the highlighted saved station. F4 confirms and F2 cancels.
 Removing the active station keeps playback running and selects it as a
 **Preview**. Preview rows cannot be removed; save the station again from search
 if needed. A failed removal leaves the saved list intact and offers F4 to
@@ -136,9 +136,9 @@ so Space and Backspace are not applied twice. Only the six physical function
 keys are used; no synthesized Fn+number shortcuts are required.
 
 Tap **Hyper** on its own to open About from the welcome screen, startup view,
-player or search. **Hyper**, **Esc** or **F2** closes it and restores the previous
-view. Playback continues, and volume and illumination remain available. F1
-opens TanRadio Options. About shows the version and AppFS
+player or search. The orange triangle labels **Close**. **F2**, **Hyper** or
+**Esc** closes About and restores the previous view. Playback continues, and
+volume and illumination remain available. F1 opens TanRadio Options. About shows the version and AppFS
 revision compiled from `metadata.json`, the firmware build version, ESP-IDF,
 BSP/LCD/ES8156 driver versions, detected display variant and panel ID, build
 date/time and a short ELF build ID. An unavailable panel ID is shown as Unknown.
@@ -185,7 +185,7 @@ by `make print-sdk`. The firmware is built as `build/tanmatsu/application.bin`.
 The release bundle contains the AppFS image `releases/TanRadio.bin` and its
 SHA-256 checksum. Run `make release` to build and generate this pair locally.
 Verify the image with `cd releases && sha256sum -c TanRadio.bin.sha256`.
-See the [release notes](releases/README.md) for the device-tested image.
+See the [release notes](releases/README.md) for the current image and verification record.
 
 The application uses **badge-bsp 2.0.0**, **LCD abstraction 2.0.0** and
 **ES8156 0.1.0** in `local-components/`, retaining TanRadio's previously tested

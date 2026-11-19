@@ -37,6 +37,7 @@ typedef struct {
     ui_preferences_t draft;
     unsigned row;
     const char *notice;
+    bool retry;
 } ui_settings_t;
 
 void ui_preferences_load(ui_preferences_t *preferences);

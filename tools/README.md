@@ -80,6 +80,11 @@ Rendering must stay on the UI task (plus startup), with at most 2 KiB of
 application render frames on its 8 KiB stack. This reserves space for graphics
 and library calls and catches target stack exhaustion missed by host tests.
 
+Run `python3 tools/tests/test_ui_shortcuts.py` after fetching PAX with
+`make build`. It uses the production PAX renderer and checks arrow direction,
+keycap placement, Backspace, and built-in function symbols on upright and
+native rotated RGB565 buffers.
+
 Run `python3 tools/tests/test_display_updates.py` to check redraw coalescing,
 frame-rate limits, native page flips, two-frame retirement, timeout ownership,
 partial updates and automatic retry delivery. These host checks do not

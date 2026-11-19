@@ -487,14 +487,15 @@ int main(void) {
     oversized = true;
     assert(radio_browser_search("oversized")); browser_worker(NULL);
     radio_browser_status(&state); assert(!state.busy && state.count == 0);
-    assert(strstr(state.message, "too large"));
+    assert(state.hint == BROWSER_HINT_NONE && strstr(state.message, "too large"));
     oversized = false; truncated = true; cache_mirrors();
     assert(radio_browser_search("partial JSON")); browser_worker(NULL);
     radio_browser_status(&state); assert(!state.busy && state.count == 0);
-    assert(strstr(state.message, "response failed"));
+    assert(state.hint == BROWSER_HINT_RETRY && strstr(state.message, "response failed"));
     truncated = false; connected = false;
     assert(radio_browser_search("offline")); browser_worker(NULL);
-    radio_browser_status(&state); assert(!state.busy && strstr(state.message, "Wi-Fi"));
+    radio_browser_status(&state);
+    assert(!state.busy && state.hint == BROWSER_HINT_RETRY && strstr(state.message, "Wi-Fi"));
     connected = true; fail_all = true; cache_mirrors();
     assert(radio_browser_search("both mirrors fail")); browser_worker(NULL);
     radio_browser_status(&state); assert(!state.busy && state.count == 0);
@@ -527,9 +528,12 @@ int main(void) {
     fail_all = true; browser_worker(NULL);
     radio_browser_status(&state);
     assert(!state.busy && state.can_retry && state.count == 39 && selected_id() == 57);
+    assert(state.hint == BROWSER_HINT_RETRY);
     assert(!state.at_start && !state.at_end);
     assert(radio_browser_retry()); fail_all = false; browser_worker(NULL);
     assert(selected_id() == 57 && strstr(last_url, "&offset=60"));
+    radio_browser_status(&state);
+    assert(state.hint == BROWSER_HINT_NONE);
     for (unsigned i = 57; i < 114; i++) {
         radio_browser_move(1); browser_worker(NULL);
         assert(selected_id() == i + 1);

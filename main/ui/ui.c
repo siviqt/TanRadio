@@ -28,7 +28,6 @@
 /* ESP-IDF */
 #include "esp_log.h"
 #include "esp_heap_caps.h"
-#include "esp_vfs_fat.h"
 
 /* FreeRTOS */
 #include "freertos/FreeRTOS.h"
@@ -53,6 +52,7 @@
 #include "ui/theme.h"
 #include "ui/exit.h"
 #include "ui/settings.h"
+#include "ui/shortcuts.h"
 #include "radio/artwork.h"
 #include "ui/about.h"
 #include "ui/about_view.h"
@@ -94,10 +94,6 @@ static pax_buf_t framebuffer = {0};
 #define UI_STATUS_SSID_LENGTH 20
 
 #define UI_KEYBOARD_BACKLIGHT_RESTORE_PERCENT 50
-#define UI_FUNCTION_ICON_COUNT 6
-#define UI_FUNCTION_ICON_SIZE 32
-#define UI_FUNCTION_ICON_BYTES \
-    (UI_FUNCTION_ICON_SIZE * UI_FUNCTION_ICON_SIZE * sizeof(pax_col_t))
 
 static ui_station_list_t ui_station_list;
 /* Search UI state is protected by ui_mutex; directory data has its own lock. */
@@ -293,105 +289,6 @@ static bool ui_update_battery(void)
     return changed;
 }
 
-static pax_buf_t ui_function_icons[UI_FUNCTION_ICON_COUNT] = {0};
-static bool ui_function_icon_loaded[UI_FUNCTION_ICON_COUNT] = {0};
-
-static void ui_load_function_icons(void)
-{
-    static const char *paths[UI_FUNCTION_ICON_COUNT] = {
-        "/int/icons/f1.png",
-        "/int/icons/f2.png",
-        "/int/icons/f3.png",
-        "/int/icons/f4.png",
-        "/int/icons/f5.png",
-        "/int/icons/f6.png",
-    };
-
-    const esp_vfs_fat_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
-        .max_files = UI_FUNCTION_ICON_COUNT,
-        .allocation_unit_size = CONFIG_WL_SECTOR_SIZE,
-        .disk_status_check_enable = false,
-        .use_one_fat = false,
-    };
-    wl_handle_t wl_handle = WL_INVALID_HANDLE;
-    esp_err_t mount_result = esp_vfs_fat_spiflash_mount_rw_wl(
-        "/int",
-        "locfd",
-        &mount_config,
-        &wl_handle);
-
-    if (mount_result != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "Shared icon filesystem unavailable: %s",
-            esp_err_to_name(mount_result));
-        return;
-    }
-
-    for (size_t index = 0; index < UI_FUNCTION_ICON_COUNT; index++) {
-        FILE *file = fopen(paths[index], "rb");
-        if (file == NULL) {
-            ESP_LOGW(TAG, "Shared function icon unavailable: %s", paths[index]);
-            continue;
-        }
-
-        void *pixels = heap_caps_calloc(
-            1,
-            UI_FUNCTION_ICON_BYTES,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-
-        if (pixels == NULL) {
-            fclose(file);
-            ESP_LOGW(TAG, "Unable to allocate function icon %zu", index + 1);
-            continue;
-        }
-
-        pax_buf_init(
-            &ui_function_icons[index],
-            pixels,
-            UI_FUNCTION_ICON_SIZE,
-            UI_FUNCTION_ICON_SIZE,
-            PAX_BUF_32_8888ARGB);
-
-        if (!pax_insert_png_fd(&ui_function_icons[index], file, 0, 0, 0)) {
-            pax_buf_destroy(&ui_function_icons[index]);
-            free(pixels);
-            memset(&ui_function_icons[index], 0, sizeof(pax_buf_t));
-            ESP_LOGW(TAG, "Unable to decode shared function icon: %s", paths[index]);
-        } else {
-            ui_function_icon_loaded[index] = true;
-        }
-
-        fclose(file);
-    }
-
-    esp_err_t unmount_result =
-        esp_vfs_fat_spiflash_unmount_rw_wl("/int", wl_handle);
-    if (unmount_result != ESP_OK) {
-        ESP_LOGW(
-            TAG,
-            "Unable to release shared icon filesystem: %s",
-            esp_err_to_name(unmount_result));
-    }
-}
-
-static bool ui_draw_function_icon(size_t index, float center_x, float center_y)
-{
-    if (index >= UI_FUNCTION_ICON_COUNT ||
-        !ui_function_icon_loaded[index]) {
-        return false;
-    }
-
-    pax_draw_image(
-        &framebuffer,
-        &ui_function_icons[index],
-        center_x - (UI_FUNCTION_ICON_SIZE / 2.0f),
-        center_y - (UI_FUNCTION_ICON_SIZE / 2.0f));
-
-    return true;
-}
-
 static void ui_ellipsize_text(
     const pax_font_t *font,
     const char *source,
@@ -520,14 +417,14 @@ static void ui_draw_button_legend(void)
                                          ui_main_selected_station(selected);
     ui_station_action_t action = ui_station_action(have_selected ? selected : NULL, playback);
     bool saved = ui_search_open && have_selected && stations_find(selected, NULL);
-    const char *labels[UI_FUNCTION_ICON_COUNT] = {
+    const char *labels[] = {
         "Options/Exit", ui_search_open ? "Back" : "Find", "Stop", ui_station_action_label(action),
         ui_search_open ? (saved ? "Saved" : "Save") : "Next", "Lights"
     };
     if (ui_remove_state.open) {
-        labels[1] = ui_catalog_busy ? "" : "Cancel";
-        labels[3] = ui_catalog_busy ? "Removing" : "Remove";
-        labels[4] = "";
+        labels[1] = ui_catalog_busy ? NULL : "Cancel";
+        labels[3] = ui_catalog_busy ? NULL : ui_remove_state.failed ? "Retry" : "Remove";
+        labels[4] = NULL;
     }
 
     pax_draw_line(
@@ -538,31 +435,14 @@ static void ui_draw_button_legend(void)
         ui_width - 8,
         separator_y);
 
-    for (size_t index = 0; index < UI_FUNCTION_ICON_COUNT; index++) {
-        const float center_x =
-            (index * UI_LEGEND_FUNCTION_WIDTH) + 24 + (index ? 16 : 0);
-        const float center_y = separator_y + 31;
-
-        if (!ui_draw_function_icon(index, center_x, center_y)) {
-            char key_label[4];
-            snprintf(key_label, sizeof(key_label), "F%u", (unsigned int)index + 1);
-            pax_draw_round_rect(&framebuffer, UI_COLOR_FIELD,
-                                center_x - 16, center_y - 13, 32, 26, 5);
-            pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_BODY, UI_TEXT_SMALL,
-                          center_x - 10, center_y - 9, key_label);
-        }
-
-        pax_draw_text(
-            &framebuffer,
-            (index == 3 && !ui_remove_state.open && action == UI_STATION_DISABLED) ||
+    for (size_t index = 0; index < sizeof(labels) / sizeof(labels[0]); index++) {
+        if (!labels[index]) continue;
+        const float x = index * UI_LEGEND_FUNCTION_WIDTH + (index ? 40 : 8);
+        bool disabled = (index == 3 && !ui_remove_state.open && action == UI_STATION_DISABLED) ||
             (index == 2 && playback->stopped) ||
-            (index == 4 && (ui_search_open ? (!have_selected || saved || ui_catalog_busy) : !stations_count()))
-                ? UI_COLOR_DISABLED : UI_COLOR_TEXT,
-            UI_FONT_BODY,
-            UI_TEXT_SMALL,
-            center_x + 18,
-            center_y - 10,
-            labels[index]);
+            (index == 4 && (ui_search_open ? (!have_selected || saved || ui_catalog_busy) : !stations_count()));
+        ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_F1 + index), labels[index], x, separator_y + 31,
+                         disabled ? UI_COLOR_DISABLED : UI_COLOR_TEXT, UI_TEXT_SMALL);
     }
 }
 
@@ -614,12 +494,12 @@ static void ui_draw_exit_confirmation(void)
     pax_draw_round_rect(&framebuffer, UI_COLOR_PANEL, 98, 107, 604, 266, 12);
     pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_HEADING,
                   38, 132, 129, "TanRadio Options");
-    pax_draw_text(&framebuffer, UI_COLOR_ACCENT, UI_FONT_BODY,
-                  UI_TEXT_BODY, 132, 203, "Press F1 again to return to launcher");
-    pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_BODY,
-                  UI_TEXT_BODY, 132, 254, "Press F2 or Esc to cancel");
-    pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_BODY,
-                  UI_TEXT_BODY, 132, 305, "Press F3 to open Settings");
+    ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_F1), "Press again to return to launcher",
+                     128, 214, UI_COLOR_ACCENT, UI_TEXT_BODY);
+    ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_F2), "Cancel",
+                     128, 265, UI_COLOR_TEXT, UI_TEXT_BODY);
+    ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_F3), "Open Settings",
+                     128, 316, UI_COLOR_TEXT, UI_TEXT_BODY);
 }
 
 /* Call after rendering, with no UI lock held. Never publish the radio exit
@@ -820,7 +700,7 @@ static void ui_draw_search(void)
     char line[160];
     ui_ellipsize_text(UI_FONT_BODY, ui_search_query[0] ? ui_search_query :
                       (ui_search_mode == BROWSER_SEARCH_COUNTRY ? "Country name or code (e.g. Bulgaria or BG)" :
-                       "Station name (Enter to search)"),
+                       "Station name"),
                       line, sizeof(line), 22, 716);
     pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_BODY, 22, 38, 124, line);
     ui_ellipsize_text(UI_FONT_BODY, ui_search_notice[0] ? ui_search_notice : search.message,
@@ -847,9 +727,15 @@ static void ui_draw_search(void)
         ui_ellipsize_text(UI_FONT_BODY, line, details, sizeof(details), UI_TEXT_SMALL, 274);
         pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL, 490, y + 1, details);
     }
-    const float footer_y = 376;
-    pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL, 24, footer_y,
-                  "Tab Name/Country   Enter Search   ↑↓ Browse");
+    const float footer_y = 385;
+    const char *submit = search.hint == BROWSER_HINT_RETRY ? "Retry" :
+                         search.hint == BROWSER_HINT_SEARCH_AGAIN ? "Search again" : "Search";
+    float next_x = ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_TAB), "Name/Country",
+                                    24, footer_y, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
+    next_x = ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_ENTER), submit,
+                              next_x + 22, footer_y, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
+    ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_UP, UI_KEY_DOWN), "Browse",
+                     next_x + 22, footer_y, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
     const char *boundary = NULL;
     if (search.at_start) {
         boundary = search.at_end ? "Only result" : "Start of results";
@@ -859,7 +745,7 @@ static void ui_draw_search(void)
     if (boundary) {
         float width = pax_text_size(UI_FONT_BODY, UI_TEXT_SMALL, boundary).x;
         pax_draw_text(&framebuffer, UI_COLOR_ACCENT, UI_FONT_BODY, UI_TEXT_SMALL,
-                      776 - width, footer_y, boundary);
+                      776 - width, footer_y - UI_TEXT_SMALL / 2, boundary);
     }
     const radio_station_t *playing = &ui_render_state.now_playing.playback.station;
     if (playing->url[0]) {
@@ -883,11 +769,11 @@ static void ui_draw_remove_dialog(void)
                   36, 104, "Remove this station from saved stations?");
     pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_BODY, 28, 36, 164, first);
     pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_BODY, 28, 36, 204, second);
-    pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, 20, 36, 274,
-                  ui_catalog_busy ? "Removing station…" : "F4 Remove     F2 Cancel");
-    if (ui_remove_state.failed) {
-        pax_draw_text(&framebuffer, UI_COLOR_WARNING, UI_FONT_BODY, 18, 36, 330,
-                      "Could not remove. Check the SD card. F4 retries; F2 cancels.");
+    if (ui_catalog_busy) {
+        pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, 20, 36, 274, "Removing station…");
+    } else if (ui_remove_state.failed) {
+        pax_draw_text(&framebuffer, UI_COLOR_WARNING, UI_FONT_BODY, 20, 36, 274,
+                      "Could not remove. Check the SD card.");
     }
     ui_draw_button_legend();
 }
@@ -912,10 +798,14 @@ static void ui_draw_startup(void)
     pax_draw_text(&framebuffer, UI_COLOR_TEXT, UI_FONT_HEADING,
                   UI_TEXT_TITLE, 44, 172, failed ? "Radio startup unavailable" : "Starting radio...");
     pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY,
-                  UI_TEXT_BODY, 44, 232, failed ? "Open F1 Options to return to the launcher and try again." :
+                  UI_TEXT_BODY, 44, 232, failed ? "Open Options to return to the launcher and try again." :
                   "Preparing Wi-Fi and your SD-card stations.");
-    pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY,
-                  UI_TEXT_SMALL, 24, 439, "F1 Options/Exit     F6 Lights     Volume keys remain available");
+    float next_x = ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_F1), "Options/Exit",
+                                    16, 448, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
+    next_x = ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_F6), "Lights",
+                              next_x + 22, 448, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
+    ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_VOLUME_DOWN, UI_KEY_VOLUME_UP), "Volume",
+                     next_x + 22, 448, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
 }
 
 static void ui_draw_station_logo(const radio_playback_status_t *playback)
@@ -1130,14 +1020,8 @@ static void ui_render(void)
             210,
             "No stations configured");
 
-        pax_draw_text(
-            &framebuffer,
-            UI_COLOR_SECONDARY,
-            UI_FONT_BODY,
-            22,
-            36,
-            260,
-            "Press F2 to find and save stations");
+        ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_F2), "Find and save stations",
+                         30, 271, UI_COLOR_SECONDARY, UI_TEXT_BODY);
 
         ui_draw_button_legend();
         ui_blit();
@@ -1177,18 +1061,12 @@ static void ui_render(void)
         84,
         "STATIONS");
 
-    pax_draw_text(
-        &framebuffer,
-        UI_COLOR_SECONDARY,
-        UI_FONT_BODY,
-        UI_TEXT_SMALL,
-        UI_STATION_LIST_X + 156,
-        85,
-        "↑↓ Browse");
+    ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_UP, UI_KEY_DOWN), "Browse",
+                     UI_STATION_LIST_X + 144, 94, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
 
     if (ui_station_list.selection < saved_count) {
-        pax_draw_text(&framebuffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL,
-                      UI_STATION_LIST_X, 386, "Backspace Remove");
+        ui_draw_shortcut(&framebuffer, UI_KEYS(UI_KEY_BACKSPACE), "Remove",
+                         UI_STATION_LIST_X, 395, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
     }
 
     size_t visible = station_count < UI_STATION_VISIBLE_COUNT ? station_count : UI_STATION_VISIBLE_COUNT;
@@ -1316,9 +1194,10 @@ bool ui_handle_exit_navigation(bsp_input_navigation_key_t key)
             ui_theme_select(draft.theme == UI_THEME_VIVID);
             ++ui_settings_revision;
         }
-        ui_settings.notice = !saved ? "Could not save settings · F4 retries" :
-                             !led_applied ? "Settings saved · LED update failed · F4 retries" :
+        ui_settings.notice = !saved ? "Could not save settings" :
+                             !led_applied ? "Settings saved · LED update failed" :
                              "Settings applied";
+        ui_settings.retry = !saved || !led_applied;
         xSemaphoreGive(ui_mutex);
         changed = true;
     }
@@ -1453,7 +1332,7 @@ static bool ui_search_navigation(bsp_input_navigation_key_t key)
         ui_search_notice[0] = 0;
         if (nonspace) {
             if (!radio_browser_retry() && !radio_browser_search_by(ui_search_query, ui_search_mode)) {
-                snprintf(ui_search_notice, sizeof(ui_search_notice), "Search unavailable or busy. Press Enter to retry.");
+                snprintf(ui_search_notice, sizeof(ui_search_notice), "Search unavailable or busy. Try again.");
             }
         } else {
             snprintf(ui_search_notice, sizeof(ui_search_notice), "%s", ui_search_mode == BROWSER_SEARCH_COUNTRY ?
@@ -2027,6 +1906,7 @@ void ui_init(void)
     if (res != ESP_OK)
         ESP_LOGW(TAG, "Failed to set LED brightness: %s", esp_err_to_name(res));
 
+    ui_shortcuts_load();
 }
 
 void ui_start(void)
@@ -2037,8 +1917,6 @@ void ui_start(void)
         ui_catalog_jobs = NULL;
     }
     ui_services_started = true;
-    /* Shared launcher icons are read-only; vector symbols remain the fallback. */
-    ui_load_function_icons();
 
     /*
      * Prime the status cache before the initial render.

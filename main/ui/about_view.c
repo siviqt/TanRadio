@@ -1,4 +1,5 @@
 #include "ui/about_view.h"
+#include "ui/shortcuts.h"
 #include "ui/theme.h"
 #include "tanradio_build_info.h"
 #include "esp_app_desc.h"
@@ -56,6 +57,6 @@ void ui_about_draw(pax_buf_t *buffer)
     about_row(buffer, 297, "Built", built);
     about_row(buffer, 327, "Build ID", build_id);
     pax_draw_line(buffer, UI_COLOR_BORDER, 100, 366, 700, 366);
-    pax_draw_text(buffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL,
-                  100, 392, "Hyper / Esc / F2: Close");
+    ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_F2), "Close",
+                     100, 402, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
 }

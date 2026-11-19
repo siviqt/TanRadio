@@ -1,16 +1,15 @@
-# TanRadio 0.9.0, revision 17
+# TanRadio 0.9.1, revision 18
 
-The release bundle contains the Tanmatsu ESP32-P4 AppFS image as
-`TanRadio.bin`, built with ESP-IDF 6.0.2 and BSP/LCD 2.0.0. It adds audio
-formats including AAC/AAC+, Ogg Opus/Vorbis, FLAC, and audio-only HLS.
-**F1 → F3** opens Settings, where you can choose Vivid and save it with
-**F4 Apply**. Radio Browser search loads pages in either direction and marks
-the first, last, or only result in the footer.
+`TanRadio.bin` is the Tanmatsu ESP32-P4 AppFS image built with ESP-IDF 6.0.2
+and BSP/LCD 2.0.0. It uses the Tanmatsu keyboard symbols across the UI, draws
+the arrows in their keycaps on the rotated display, and shows **⌫ Remove**
+on the player. The orange triangle labels **Cancel**, **Back**, and **Close**.
 
-All 20 regression scripts passed. The owner tested the audio formats, theme,
-and search on Tanmatsu. The release image matched the BadgeLink readback byte
-for byte. Its SHA-256 is
-`cb6355f6563b11fabeeec0bf986ffc4a822521fa665646647b485fda976c7bbb`.
+The owner confirmed the Settings arrows, player Browse arrows, and Backspace
+confirmation on the test Tanmatsu using the `0.9.0-r17` shortcut-fix candidate
+(AppFS CRC32 `b1db971a`). The `0.9.1-r18` rebuild adds the release version and
+revision and passed all 21 regression scripts. Its SHA-256 is
+`b6a26e752999664367147276754a7852f6d4dc11d0f49417ab049be557c68497`.
 
 From the release bundle's `releases/` directory, verify the downloaded image.
 
@@ -19,5 +18,5 @@ sha256sum -c TanRadio.bin.sha256
 ```
 
 The Tanmatsu app package uses `com.github.siviqt.tanradio` and AppFS
-revision **17**. The source and app package archives use the
-`TanRadio-0.9.0-r17` release name.
+revision **18**. The source and app package archives use the
+`TanRadio-0.9.1-r18` release name.

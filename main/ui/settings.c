@@ -1,4 +1,5 @@
 #include "ui/settings.h"
+#include "ui/shortcuts.h"
 #include "ui/theme.h"
 
 #include <stdio.h>
@@ -82,6 +83,7 @@ bool ui_settings_edit(ui_settings_t *settings, bsp_input_navigation_key_t key)
         settings->draft.led_brightness = brightness;
     }
     settings->notice = NULL;
+    settings->retry = false;
     return true;
 }
 
@@ -108,20 +110,35 @@ void ui_settings_draw(pax_buf_t *buffer, const ui_settings_t *settings, bool ser
     }
 
     const char *display_status = NULL;
+    bool retry = settings->retry;
     if (!services_started) {
-        if (nokia) display_status = "The display starts when you press Space.";
+        if (nokia) {
+            ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_SPACE), "Starts the external display from Welcome",
+                             text_x, 302, UI_COLOR_SECONDARY, UI_TEXT_SMALL);
+        }
     } else {
         switch (external_display_status()) {
         case EXTERNAL_DISABLED:    display_status = "External display off"; break;
         case EXTERNAL_STARTING:    display_status = "Initializing external display"; break;
         case EXTERNAL_INITIALIZED: display_status = "Nokia initialized · connection unverified"; break;
-        case EXTERNAL_FAILED:      display_status = "Display error · press F4 to retry"; break;
+        case EXTERNAL_FAILED:
+            display_status = "External display error";
+            retry |= nokia;
+            break;
         }
     }
     if (display_status)
         pax_draw_text(buffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL, text_x, 293, display_status);
     if (settings->notice)
         pax_draw_text(buffer, UI_COLOR_SECONDARY, UI_FONT_BODY, UI_TEXT_SMALL, text_x, 315, settings->notice);
-    pax_draw_text(buffer, UI_COLOR_TEXT, UI_FONT_BODY, UI_TEXT_SMALL, text_x, 356,
-                  "Arrows to edit    F4 Apply    F2 / Esc Back");
+
+    const float footer_y = 366;
+    float next_x = ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_UP, UI_KEY_DOWN), "Select",
+                                    text_x, footer_y, UI_COLOR_TEXT, UI_TEXT_SMALL);
+    next_x = ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_LEFT, UI_KEY_RIGHT), "Edit",
+                              next_x + 22, footer_y, UI_COLOR_TEXT, UI_TEXT_SMALL);
+    next_x = ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_F4), retry ? "Retry" : "Apply",
+                              next_x + 22, footer_y, UI_COLOR_TEXT, UI_TEXT_SMALL);
+    ui_draw_shortcut(buffer, UI_KEYS(UI_KEY_F2), "Back",
+                     next_x + 22, footer_y, UI_COLOR_TEXT, UI_TEXT_SMALL);
 }

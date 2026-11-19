@@ -1,5 +1,17 @@
 # TanRadio production changelog
 
+## 0.9.1 revision 18 — Tanmatsu keyboard hints — 2026-11-19
+
+- Use the Tanmatsu function-key symbols in Welcome, Options, Settings, About,
+  startup, station browsing, search, and removal and retry prompts.
+- Center the directional glyphs in their keycaps on the native rotated
+  display. Show Up/Down for Select and Left/Right for Edit in Settings.
+- Show **⌫ Remove** for saved stations and the F2 triangle for **Cancel**,
+  **Back**, and **Close**.
+- The owner confirmed the corrected Settings arrows, player Browse arrows,
+  and Backspace confirmation on Tanmatsu. The release build passed all 21
+  regression scripts, including the new rotated-framebuffer test.
+
 ## 0.9.0 revision 17 — station browsing and playback formats
 
 - Page Radio Browser results in both directions with a bounded cache. Mark

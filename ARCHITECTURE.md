@@ -85,6 +85,8 @@ rows on a page. Pages use name order on a single mirror per search, with UUID
 and URL deduplication across cached results. The viewport snapshot includes
 whether the highlighted result is at either confirmed boundary. The footer
 uses those flags while loading and retry messages have their own status line.
+The search status also carries the Enter action for a retry or a new search,
+so the footer can label that key alongside the directory message.
 
 The SD catalog is `/tanradio/stations.txt`. New catalogs are empty. Saves preserve
 existing records/comments and prevent UUID/URL duplicates. A temporary file and
@@ -133,6 +135,13 @@ frames per second; hardware status polling remains on a one-second cadence.
 Renderer-owned station snapshots keep large records out of nested stack frames.
 Target compiler stack accounting and object-code call sites are checked by
 `tools/tests/test_ui_stack.py`.
+
+`ui/shortcuts.c` loads shared Tanmatsu launcher artwork before Welcome and
+draws keyboard hints across the application. It provides built-in function
+symbols, arrowheads and the Backspace glyph. The Tanmatsu's native 480 × 800
+RGB565 framebuffer is rotated to a logical 800 × 480 view. Shortcut strokes
+use PAX triangles so the glyphs rotate with their keycaps. The shortcut
+regression checks glyph placement and direction in both orientations.
 
 PAX renders RGB565 into its application buffer. The local Tanmatsu BSP copies the
 complete image into the inactive native panel framebuffer, then submits that
